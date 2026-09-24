@@ -14,7 +14,16 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { AttachmentBuilder, Client, type DMChannel, Events, GatewayIntentBits, type Message, Partials } from "discord.js";
+import {
+	AttachmentBuilder,
+	Client,
+	type DMChannel,
+	Events,
+	GatewayIntentBits,
+	type Message,
+	MessageReferenceType,
+	Partials,
+} from "discord.js";
 import { Type } from "typebox";
 
 const DIR = join(getAgentDir(), "discord-dms");
@@ -160,6 +169,16 @@ function describeTool(name: string, args: unknown): string {
 	let summary = (detail as string).replace(/\s+/g, " ").replace(/`/g, "'").trim();
 	if (summary.length > 80) summary = `${summary.slice(0, 77)}…`;
 	return summary ? `**${name}** \`${summary}\`` : `**${name}**`;
+}
+
+/** Context line for a Discord reply, written in the user's voice. */
+function describeReply(quoted: Message, fromPi: boolean): string {
+	let excerpt = quoted.content.replace(/\s+/g, " ").trim();
+	if (excerpt.length > 300) excerpt = `${excerpt.slice(0, 297)}…`;
+	if (!excerpt && quoted.attachments.size > 0) {
+		excerpt = `attachments: ${[...quoted.attachments.values()].map((a) => a.name).join(", ")}`;
+	}
+	return `(replying to ${fromPi ? "your" : "my own"} earlier message: "${excerpt}")`;
 }
 
 function expandPath(path: string, cwd: string): string {
@@ -429,9 +448,52 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		// Prompt templates and skills expand into a user message that answers to Discord.
-		armNextUser = true;
 		startTyping();
-		pi.sendUserMessage(line, { expandPromptTemplates: true, deliverAs: "steer" });
+		deliver(() => {
+			armNextUser = true;
+			pi.sendUserMessage(line, { expandPromptTemplates: true, deliverAs: "steer" });
+		});
+	};
+
+	// --- delivery -----------------------------------------------------------------
+
+	// prompt() rejects while a manual compaction or branch summary runs, and two prompts
+	// sent while idle race to start a run. Deliver one at a time, holding while pi is
+	// busy with something other than a run, like the TUI does with typed messages.
+	const outbox: Array<() => void> = [];
+	let starting: ReturnType<typeof setTimeout> | undefined; // idle send awaiting agent_start
+	let outboxTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const pumpOutbox = () => {
+		if (outboxTimer) clearTimeout(outboxTimer);
+		outboxTimer = undefined;
+		while (outbox.length > 0 && !starting) {
+			if (runActive) {
+				outbox.shift()?.(); // steers into the active run
+				continue;
+			}
+			if (ctxRef && !ctxRef.isIdle()) {
+				outboxTimer = setTimeout(pumpOutbox, 500);
+				return;
+			}
+			outbox.shift()?.();
+			starting = setTimeout(() => {
+				starting = undefined;
+				pumpOutbox();
+			}, 5000);
+		}
+	};
+
+	const deliver = (send: () => void) => {
+		outbox.push(send);
+		pumpOutbox();
+	};
+
+	const clearOutbox = () => {
+		outbox.length = 0;
+		if (outboxTimer) clearTimeout(outboxTimer);
+		if (starting) clearTimeout(starting);
+		outboxTimer = starting = undefined;
 	};
 
 	// --- inbound Discord messages ----------------------------------------------
@@ -454,6 +516,10 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const lines = text ? [text] : [];
+		if (message.reference?.type === MessageReferenceType.Default && message.reference.messageId) {
+			const quoted = await message.fetchReference().catch(() => undefined);
+			if (quoted) lines.unshift(describeReply(quoted, quoted.author.id === message.client.user.id));
+		}
 		const images: ImageContent[] = [];
 		for (const attachment of message.attachments.values()) {
 			const response = await fetch(attachment.url);
@@ -471,7 +537,9 @@ export default function (pi: ExtensionAPI) {
 		const body = `${PREFIX} ${lines.join("\n")}`;
 		startTyping();
 		// Like pressing Enter in the TUI: starts a run when idle, steers when busy.
-		pi.sendUserMessage(images.length > 0 ? [{ type: "text", text: body }, ...images] : body, { deliverAs: "steer" });
+		deliver(() =>
+			pi.sendUserMessage(images.length > 0 ? [{ type: "text", text: body }, ...images] : body, { deliverAs: "steer" }),
+		);
 	};
 
 	// --- connection lifecycle ----------------------------------------------------
@@ -666,6 +734,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		clearOutbox();
 		await disconnect({ release: event.reason === "quit", tools: false });
 	});
 
@@ -729,7 +798,10 @@ export default function (pi: ExtensionAPI) {
 	// Typing shows for every run while connected; it never notifies.
 	pi.on("agent_start", () => {
 		runActive = true;
+		if (starting) clearTimeout(starting);
+		starting = undefined;
 		startTyping();
+		pumpOutbox();
 	});
 
 	pi.on("agent_settled", () => {

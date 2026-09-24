@@ -37,9 +37,13 @@ instead. The environment variables take priority over the file.
 | pi | `/discord status` | Show whether this session is connected |
 | shell | `pi --discord` | Start connected |
 | Discord | any message | Sent to pi. Starts a run when pi is idle and steers the run when pi is busy |
+| Discord | a reply | Pi gets up to 300 characters of the message you replied to as context |
 | Discord | `!stop` | Abort the current run |
 | Discord | `./command args` | Run a pi slash command. See below |
 | Discord | attachments | Saved under `~/.pi/agent/discord-dms/inbox/`. Pi gets the file paths, and images are also sent inline |
+
+Pi rejects new prompts while a manual compaction or branch summary is running. Messages you send
+during one wait and go through once it finishes, as they do when typed in the TUI.
 
 ### Slash commands from Discord
 
