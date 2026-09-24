@@ -268,7 +268,6 @@ export default function (pi: ExtensionAPI) {
 
 	const finishRun = () => {
 		armed = false;
-		stopTyping();
 		if (statusTimer) clearTimeout(statusTimer);
 		statusTimer = undefined;
 		enqueue(async () => {
@@ -384,6 +383,7 @@ export default function (pi: ExtensionAPI) {
 	const disconnect = async (options: { release: boolean; tools: boolean }) => {
 		unwatchFile(LOCK_FILE, onLockChange);
 		if (armed) finishRun();
+		stopTyping();
 		await queue.catch(() => {});
 		const current = client;
 		client = undefined;
@@ -528,7 +528,6 @@ export default function (pi: ExtensionAPI) {
 		if (fromDiscord && dm) {
 			if (!armed) resetRun();
 			armed = true;
-			startTyping();
 		} else if (!fromDiscord) {
 			// A TUI or other non-Discord prompt took over the conversation.
 			localRun = true;
@@ -563,13 +562,16 @@ export default function (pi: ExtensionAPI) {
 		bumpStatus();
 	});
 
+	// Typing shows for every run while connected; it never notifies.
 	pi.on("agent_start", () => {
 		runActive = true;
+		startTyping();
 	});
 
 	pi.on("agent_settled", () => {
 		runActive = false;
 		localRun = false;
+		stopTyping();
 		if (armed) finishRun();
 	});
 }
