@@ -399,6 +399,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "new":
 			case "reload":
+				// The TUI's reload refuses mid-run and only warns in the TUI; /new aborts the run itself.
+				if (name === "reload" && !ctx.isIdle()) {
+					void note("wait for pi to finish before reloading, or ./stop first");
+					return;
+				}
 				// Session replacement needs a command context, which only a registered command gets.
 				await note(name === "new" ? "starting a new session" : "reloading");
 				pi.sendUserMessage(`/discord ${INTERNAL_PREFIX}${name}`, { expandPromptTemplates: true });
