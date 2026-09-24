@@ -405,7 +405,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				// Session replacement needs a command context, which only a registered command gets.
-				await note(name === "new" ? "starting a new session" : "reloading");
+				await note(name === "new" ? "starting a new session now, back in a few seconds" : "reloading now, back in a few seconds");
 				pi.sendUserMessage(`/discord ${INTERNAL_PREFIX}${name}`, { expandPromptTemplates: true });
 				return;
 		}
