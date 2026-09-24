@@ -38,7 +38,21 @@ instead. The environment variables take priority over the file.
 | shell | `pi --discord` | Start connected |
 | Discord | any message | Sent to pi. Starts a run when pi is idle and steers the run when pi is busy |
 | Discord | `!stop` | Abort the current run |
+| Discord | `./command args` | Run a pi slash command. See below |
 | Discord | attachments | Saved under `~/.pi/agent/discord-dms/inbox/`. Pi gets the file paths, and images are also sent inline |
+
+### Slash commands from Discord
+
+Discord takes over messages that start with `/`, so type `./` instead: `./compact`, `./model sonnet`.
+
+- **Extension commands** run as if typed in the TUI. Their output shows in the TUI, and Discord gets a ✅.
+- **Prompt templates and skills** (`./review`, `./skill:name`) expand into a prompt, and the reply
+  comes back to Discord.
+- **Built-ins that work from Discord:** `./help`, `./stop`, `./compact [instructions]`,
+  `./model [search]`, `./thinking [level]`, `./name [name]`, `./session`, `./new` and `./reload`.
+  Without arguments, `./model`, `./thinking` and `./name` show the current value.
+- **TUI-only built-ins:** the rest open pickers or dialogs, such as `/tree`, `/settings` and
+  `/resume`.
 
 ### Only one session owns the DM
 

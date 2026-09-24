@@ -23,11 +23,16 @@ const LOCK_FILE = join(DIR, "lock.json");
 const INBOX_DIR = join(DIR, "inbox");
 
 const PREFIX = "[discord]";
+const INTERNAL_PREFIX = "__from-discord:";
 const ENTRY_TYPE = "discord-dms";
 const TOOL_NAME = "discord_send_files";
 const MAX_CHUNK = 1900;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const STATUS_THROTTLE_MS = 1500;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+/** Built-ins reimplemented for Discord; the rest need the TUI. */
+const DISCORD_BUILTINS = ["help", "stop", "compact", "model", "thinking", "name", "session", "new", "reload"];
+const TUI_BUILTINS = ["settings", "tree", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout", "resume", "quit"];
 const MAX_STATUS_LINES = 20;
 const TOOL_ICONS = { running: "⏳", done: "✅", error: "❌" } as const;
 
@@ -176,6 +181,9 @@ export default function (pi: ExtensionAPI) {
 	let armed = false;
 	let runActive = false; // between agent_start and agent_settled
 	let localRun = false; // a non-Discord user message joined this run
+	// A ./template or ./skill: from Discord expands without the [discord] prefix, so
+	// the next user message is assumed to be it.
+	let armNextUser = false;
 	let typingTimer: ReturnType<typeof setInterval> | undefined;
 
 	// Tool-call status message: one live message per armed run, reposted below new text.
@@ -300,6 +308,124 @@ export default function (pi: ExtensionAPI) {
 			if (statusMsg) statusStale = true;
 		});
 
+	// --- ./commands -------------------------------------------------------------
+
+	const note = (text: string) => post(`-# ${text}`);
+
+	/** Run a pi slash command sent from Discord as ./command. `line` starts with "/". */
+	const runCommand = async (line: string, message: Message, ctx: ExtensionContext) => {
+		const space = line.indexOf(" ");
+		const name = (space === -1 ? line.slice(1) : line.slice(1, space)).toLowerCase();
+		const args = space === -1 ? "" : line.slice(space + 1).trim();
+		const ok = () => message.react("✅").catch(() => {});
+
+		switch (name) {
+			case "help": {
+				const commands = pi.getCommands().map((c) => `\`./${c.name}\`${c.description ? ` ${c.description}` : ""}`);
+				void post(
+					[
+						`**Built-in:** ${DISCORD_BUILTINS.map((n) => `\`./${n}\``).join(" ")}`,
+						`**TUI only:** ${TUI_BUILTINS.map((n) => `\`/${n}\``).join(" ")}`,
+						...(commands.length > 0 ? ["**Extensions, prompts and skills:**", ...commands] : []),
+					].join("\n"),
+				);
+				return;
+			}
+			case "stop":
+			case "abort":
+				ctx.abort();
+				await message.react("⏹️").catch(() => {});
+				return;
+			case "compact":
+				await message.react("⏳").catch(() => {});
+				ctx.compact({
+					customInstructions: args || undefined,
+					onComplete: () => void note("compacted"),
+					onError: (err) => void note(`compaction failed: ${err.message}`),
+				});
+				return;
+			case "model": {
+				const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+				if (!args) {
+					void note(`model: ${current}`);
+					return;
+				}
+				const query = args.toLowerCase();
+				const models = ctx.modelRegistry.getAvailable();
+				const exact = models.filter(
+					(m) => `${m.provider}/${m.id}`.toLowerCase() === query || m.id.toLowerCase() === query,
+				);
+				const matches = exact.length > 0 ? exact : models.filter((m) => `${m.provider}/${m.id}`.toLowerCase().includes(query));
+				if (matches.length !== 1) {
+					const list = matches.slice(0, 15).map((m) => `\`${m.provider}/${m.id}\``).join(" ");
+					void note(matches.length === 0 ? `no model matches "${args}"` : `ambiguous: ${list}`);
+					return;
+				}
+				const model = matches[0];
+				if (await pi.setModel(model)) void note(`model: ${model.provider}/${model.id}`);
+				else void note(`no credentials for ${model.provider}`);
+				return;
+			}
+			case "thinking": {
+				if (args) {
+					if (!(THINKING_LEVELS as readonly string[]).includes(args)) {
+						void note(`levels: ${THINKING_LEVELS.join(", ")}`);
+						return;
+					}
+					pi.setThinkingLevel(args as (typeof THINKING_LEVELS)[number]);
+				}
+				void note(`thinking: ${pi.getThinkingLevel()}`);
+				return;
+			}
+			case "name":
+				if (args) pi.setSessionName(args);
+				void note(`session name: ${pi.getSessionName() ?? "(none)"}`);
+				return;
+			case "session": {
+				const usage = ctx.getContextUsage();
+				const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none";
+				void post(
+					[
+						`**${pi.getSessionName() ?? "unnamed session"}**`,
+						`model \`${model}\` · thinking ${pi.getThinkingLevel()}`,
+						usage?.percent != null ? `context ${Math.round(usage.percent)}% of ${usage.contextWindow}` : "",
+						`cwd \`${ctx.cwd}\``,
+						`file \`${ctx.sessionManager.getSessionFile() ?? "(in memory)"}\``,
+					]
+						.filter(Boolean)
+						.join("\n"),
+				);
+				return;
+			}
+			case "new":
+			case "reload":
+				// Session replacement needs a command context, which only a registered command gets.
+				await note(name === "new" ? "starting a new session" : "reloading");
+				pi.sendUserMessage(`/discord ${INTERNAL_PREFIX}${name}`, { expandPromptTemplates: true });
+				return;
+		}
+
+		if (TUI_BUILTINS.includes(name)) {
+			void note(`/${name} only works in the TUI`);
+			return;
+		}
+		const command = pi.getCommands().find((c) => c.name.toLowerCase() === name);
+		if (!command) {
+			void note(`unknown command /${name}; try ./help`);
+			return;
+		}
+		if (command.source === "extension") {
+			// Its output goes to the TUI; acknowledge here.
+			pi.sendUserMessage(line, { expandPromptTemplates: true });
+			await ok();
+			return;
+		}
+		// Prompt templates and skills expand into a user message that answers to Discord.
+		armNextUser = true;
+		startTyping();
+		pi.sendUserMessage(line, { expandPromptTemplates: true, deliverAs: "steer" });
+	};
+
 	// --- inbound Discord messages ----------------------------------------------
 
 	const onDiscordMessage = async (message: Message, userId: string) => {
@@ -311,6 +437,11 @@ export default function (pi: ExtensionAPI) {
 		if (/^!(stop|abort)$/i.test(text)) {
 			ctx.abort();
 			await message.react("⏹️").catch(() => {});
+			return;
+		}
+
+		if (/^\.\/\S/.test(text)) {
+			await runCommand(text.slice(1), message, ctx);
 			return;
 		}
 
@@ -486,6 +617,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === `${INTERNAL_PREFIX}new`) {
+				await ctx.newSession();
+				return;
+			}
+			if (sub === `${INTERNAL_PREFIX}reload`) {
+				await ctx.reload();
+				return;
+			}
+
 			if (sub === "status") {
 				const holder = otherLockHolder();
 				const state = client
@@ -524,7 +664,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_start", (event, ctx) => {
 		ctxRef = ctx;
 		if (event.message.role !== "user") return;
-		const fromDiscord = textOf(event.message.content).startsWith(PREFIX);
+		const fromDiscord = textOf(event.message.content).startsWith(PREFIX) || armNextUser;
+		armNextUser = false;
 		if (fromDiscord && dm) {
 			if (!armed) resetRun();
 			armed = true;
