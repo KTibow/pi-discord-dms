@@ -76,13 +76,15 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
   messages remain. It also disarms when a user message that didn't come from Discord enters the
   transcript, such as something you type or queue in the TUI. From then on the output stays
   local.
-- Runs that no user message started post their assistant text too, unless it's `[silent]`. That
-  covers another extension's message waking the agent, or the agent continuing on its own. The
+- Runs that another extension started post their assistant text too, unless it's `[silent]`.
+  That covers custom messages and user messages sent with `sendUserMessage`, such as a
+  heartbeat. It also covers the agent continuing on its own. Only something you type or queue
+  in the TUI, or send over RPC, counts as a local run. The
   agent spoke instead of staying silent, so it probably has something to tell you. These runs
   show no tool status, since their tool calls may not lead anywhere.
 - The typing indicator shows whenever pi is working, whoever started the run. It never sends a
   notification.
-- Custom messages from other extensions don't change the armed state.
+- Messages from other extensions never switch Discord posting on or off.
 
 Pi sends files with the `discord_send_files` tool (`paths`, optional `caption`, 10 MB per file).
 The tool is active only while the session is connected. Ordinary replies don't need a tool.

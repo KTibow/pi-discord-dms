@@ -4,9 +4,9 @@
  * Replies are "armed" by a Discord message: from the moment a [discord] user
  * message enters the transcript until the agent settles (or a non-Discord user
  * message takes over), assistant text and tool progress are forwarded to the DM.
- * Runs started by a local user message stay local. Runs with no user message at
- * all (woken by another extension, or continuing on their own) forward only
- * assistant text, since the agent chose not to reply [silent].
+ * Runs started by a local (TUI/RPC) user message stay local. Runs woken by another
+ * extension (custom messages, or user messages it sends) or continuing on their own
+ * forward only assistant text, since the agent chose not to reply [silent].
  */
 
 import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
@@ -184,6 +184,9 @@ export default function (pi: ExtensionAPI) {
 	// A ./template or ./skill: from Discord expands without the [discord] prefix, so
 	// the next user message is assumed to be it.
 	let armNextUser = false;
+	// Texts other extensions submitted via sendUserMessage, matched when they reach the
+	// transcript so their user messages count as wakes rather than a local takeover.
+	const extensionInputs: string[] = [];
 	let typingTimer: ReturnType<typeof setInterval> | undefined;
 
 	// Tool-call status message: one live message per armed run, reposted below new text.
@@ -669,16 +672,31 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_start", (event, ctx) => {
 		ctxRef = ctx;
 		if (event.message.role !== "user") return;
-		const fromDiscord = textOf(event.message.content).startsWith(PREFIX) || armNextUser;
+		const text = textOf(event.message.content);
+		const fromDiscord = text.startsWith(PREFIX) || armNextUser;
 		armNextUser = false;
-		if (fromDiscord && dm) {
+		if (fromDiscord) {
+			if (!dm) return;
 			if (!armed) resetRun();
 			armed = true;
-		} else if (!fromDiscord) {
-			// A TUI or other non-Discord prompt took over the conversation.
-			localRun = true;
-			if (armed) finishRun();
+			return;
 		}
+		const wake = extensionInputs.findIndex((input) => text.startsWith(input));
+		if (wake !== -1) {
+			// Another extension woke the agent: behave like a custom message.
+			extensionInputs.splice(wake, 1);
+			return;
+		}
+		// A TUI or RPC prompt took over the conversation.
+		localRun = true;
+		if (armed) finishRun();
+	});
+
+	pi.on("input", (event) => {
+		if (event.source !== "extension" || event.text.startsWith(PREFIX) || !event.text.trim()) return;
+		extensionInputs.push(event.text);
+		// Inputs another handler swallowed never arrive; don't let them pile up.
+		if (extensionInputs.length > 20) extensionInputs.shift();
 	});
 
 	pi.on("message_end", (event) => {
