@@ -62,8 +62,11 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
   messages remain. It also disarms when a user message that didn't come from Discord enters the
   transcript, such as something you type or queue in the TUI. From then on the output stays
   local.
-- Custom messages from other extensions don't change the armed state. Any turns they start while
-  the bridge is disarmed are never posted.
+- Runs that no user message started post their assistant text too, unless it's `[silent]`. That
+  covers another extension's message waking the agent, or the agent continuing on its own. The
+  agent spoke instead of staying silent, so it probably has something to tell you. These runs
+  show no tool status or typing indicator, since their tool calls may not lead anywhere.
+- Custom messages from other extensions don't change the armed state.
 
 Pi sends files with the `discord_send_files` tool (`paths`, optional `caption`, 10 MB per file).
 The tool is active only while the session is connected. Ordinary replies don't need a tool.

@@ -3,8 +3,10 @@
  *
  * Replies are "armed" by a Discord message: from the moment a [discord] user
  * message enters the transcript until the agent settles (or a non-Discord user
- * message takes over), assistant text is forwarded to the DM. Everything else
- * (TUI prompts, other extensions' turns) stays local.
+ * message takes over), assistant text and tool progress are forwarded to the DM.
+ * Runs started by a local user message stay local. Runs with no user message at
+ * all (woken by another extension, or continuing on their own) forward only
+ * assistant text, since the agent chose not to reply [silent].
  */
 
 import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
@@ -172,6 +174,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Reply routing state
 	let armed = false;
+	let runActive = false; // between agent_start and agent_settled
+	let localRun = false; // a non-Discord user message joined this run
 	let typingTimer: ReturnType<typeof setInterval> | undefined;
 
 	// Tool-call status message: one live message per armed run, reposted below new text.
@@ -525,16 +529,22 @@ export default function (pi: ExtensionAPI) {
 			if (!armed) resetRun();
 			armed = true;
 			startTyping();
-		} else if (!fromDiscord && armed) {
+		} else if (!fromDiscord) {
 			// A TUI or other non-Discord prompt took over the conversation.
-			finishRun();
+			localRun = true;
+			if (armed) finishRun();
 		}
 	});
 
 	pi.on("message_end", (event) => {
-		if (!armed || event.message.role !== "assistant") return;
+		if (event.message.role !== "assistant") return;
 		const message = event.message;
 		const text = textOf(message.content).trim();
+		if (!armed) {
+			// Autonomous run: forward what the agent chose to say, nothing else.
+			if (runActive && !localRun && dm && !isSilent(text)) void post(text);
+			return;
+		}
 		if (!isSilent(text)) void post(text);
 		if (message.stopReason === "error") void post(`⚠️ ${message.errorMessage ?? "error"}`);
 		else if (message.stopReason === "aborted") void post("⏹️ aborted");
@@ -553,7 +563,13 @@ export default function (pi: ExtensionAPI) {
 		bumpStatus();
 	});
 
+	pi.on("agent_start", () => {
+		runActive = true;
+	});
+
 	pi.on("agent_settled", () => {
+		runActive = false;
+		localRun = false;
 		if (armed) finishRun();
 	});
 }
