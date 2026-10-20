@@ -212,14 +212,14 @@ function describeReply(quoted: Message, fromPi: boolean): string {
  * Context for a message picked with "Send to pi", in the user's voice. It arrives as
  * raw API data when the bot isn't in that server.
  */
-function describeShared(target: Message | APIMessage, link: string, userId: string, botId: string) {
+function describeShared(target: Message | APIMessage, where: string, userId: string, botId: string) {
 	const author =
 		target.author.id === userId
 			? "my"
 			: target.author.id === botId
 				? "your"
 				: `${target instanceof Message ? (target.author.globalName ?? target.author.username) : (target.author.global_name ?? target.author.username)}'s`;
-	const lines = [`(sharing ${author} message from ${link})`];
+	const lines = [`(sharing ${author} message from ${where})`];
 	const quote = (text: string) => lines.push(...text.split("\n").map((line) => `> ${line}`));
 	if (target.content) quote(target.content);
 	for (const embed of target.embeds) {
@@ -666,6 +666,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		const inDm = interaction.channelId === dm?.id;
 		const here = `https://discord.com/channels/${interaction.guildId ?? "@me"}/${interaction.channelId}`;
+		const place = interaction.guildId
+			? `server ${interaction.guildId}, channel ${interaction.channelId}`
+			: inDm
+				? "our DM"
+				: `a DM or group DM, channel ${interaction.channelId}`;
 
 		if (interaction.isChatInputCommand()) {
 			if (interaction.commandName === YO_COMMAND) await interaction.showModal(shareModal(YO_COMMAND, "Message pi", "Message"));
@@ -676,7 +681,7 @@ export default function (pi: ExtensionAPI) {
 			if (interaction.commandName !== SHARE_COMMAND) return;
 			const target = interaction.targetMessage as Message | APIMessage;
 			const customId = `${SHARE_PREFIX}${interaction.id}`;
-			shares.set(customId, describeShared(target, `${here}/${target.id}`, userId, interaction.client.user.id));
+			shares.set(customId, describeShared(target, `${place}: ${here}/${target.id}`, userId, interaction.client.user.id));
 			setTimeout(() => shares.delete(customId), SHARE_TTL_MS).unref();
 			await interaction.showModal(shareModal(customId, "Send to pi", "Note (optional)"));
 			return;
@@ -684,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 
 		const share =
 			interaction.customId === YO_COMMAND
-				? { lines: inDm ? [] : [`(sent with /yo from ${here})`], files: [] }
+				? { lines: inDm ? [] : [`(sent with /yo from ${place}: ${here})`], files: [] }
 				: shares.get(interaction.customId);
 		shares.delete(interaction.customId);
 		if (!share) {
@@ -803,7 +808,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			`User messages beginning with ${PREFIX} were sent from the user's Discord DM. Your assistant text while answering them is forwarded to that DM automatically, so reply naturally, like texting. Don't use a tool to send text.`,
 			`If a reply to a ${PREFIX} message needs no Discord message, make that text exactly [silent].`,
-			`${PREFIX} messages that mention /yo or sharing a message came from another Discord channel, identified by its link. Your reply still goes to the DM, since this bot can't post there.`,
+			`${PREFIX} messages "sent with /yo" or "sharing" a message came from another Discord channel, named by server and channel ID. Your text replies still go to the DM. This extension can't read or post in that channel, but you might: before saying you can't, check AGENTS.md and your notes for access to that server, such as another bot.`,
 			`Use ${TOOL_NAME} to send files such as screenshots, images, logs or documents to the Discord DM. Discord renders Markdown but not tables.`,
 		],
 		parameters: Type.Object({

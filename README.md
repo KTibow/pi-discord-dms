@@ -55,10 +55,10 @@ during one wait and go through once it finishes, as they do when typed in the TU
 ### Sending from other channels
 
 `/yo` and **Send to pi** work in servers, group DMs and other DMs. Only you can see the
-"Sent to pi" confirmation, and pi's reply comes to the bot's DM like any other. Pi gets a
-`discord.com/channels/...` link to where you sent it from. If pi can read that server some other
-way, such as through another bot, it can use the link to look around. Otherwise it only has what
-you sent.
+"Sent to pi" confirmation, and pi's reply comes to the bot's DM like any other. Pi gets the
+server and channel IDs and a link to where you sent it from. If pi can read that server some
+other way, such as through another bot, it's told to check before saying it can't. Note in
+AGENTS.md which access goes with which server ID, and how to use it.
 
 The bot registers both commands when it connects. Without User Install they only work in
 servers the bot is in, and `/discord status` says so. New commands can take a minute to appear,
