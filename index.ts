@@ -7,6 +7,9 @@
  * Runs started by a local (TUI/RPC) user message stay local. Runs woken by another
  * extension (custom messages, or user messages it sends) or continuing on their own
  * forward only assistant text, since the agent chose not to reply [silent].
+ *
+ * /yo and the "Send to pi" message action bring in text, files or a message from any
+ * channel. Pi still answers in the DM.
  */
 
 import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
@@ -15,14 +18,26 @@ import { basename, join, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
+	type APIMessage,
+	type ApplicationCommandData,
+	ApplicationCommandType,
+	ApplicationIntegrationType,
 	AttachmentBuilder,
 	Client,
 	type DMChannel,
 	Events,
+	FileUploadBuilder,
 	GatewayIntentBits,
-	type Message,
+	type Interaction,
+	InteractionContextType,
+	LabelBuilder,
+	Message,
+	MessageFlags,
 	MessageReferenceType,
+	ModalBuilder,
 	Partials,
+	TextInputBuilder,
+	TextInputStyle,
 } from "discord.js";
 import { Type } from "typebox";
 
@@ -44,11 +59,23 @@ const DISCORD_BUILTINS = ["help", "stop", "compact", "model", "thinking", "name"
 const TUI_BUILTINS = ["settings", "tree", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout", "resume", "quit"];
 const MAX_STATUS_LINES = 20;
 const TOOL_ICONS = { running: "⏳", done: "✅", error: "❌" } as const;
+const YO_COMMAND = "yo";
+const SHARE_COMMAND = "Send to pi";
+const SHARE_PREFIX = "share:";
+const SHARE_TTL_MS = 15 * 60 * 1000;
+const MODAL_TEXT = "text";
+const MODAL_FILES = "files";
 
 interface ToolLine {
 	id: string;
 	text: string;
 	state: keyof typeof TOOL_ICONS;
+}
+
+interface IncomingFile {
+	url: string;
+	name: string;
+	contentType: string | null | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +208,75 @@ function describeReply(quoted: Message, fromPi: boolean): string {
 	return `(replying to ${fromPi ? "your" : "my own"} earlier message: "${excerpt}")`;
 }
 
+/**
+ * Context for a message picked with "Send to pi", in the user's voice. It arrives as
+ * raw API data when the bot isn't in that server.
+ */
+function describeShared(target: Message | APIMessage, link: string, userId: string, botId: string) {
+	const author =
+		target.author.id === userId
+			? "my"
+			: target.author.id === botId
+				? "your"
+				: `${target instanceof Message ? (target.author.globalName ?? target.author.username) : (target.author.global_name ?? target.author.username)}'s`;
+	const lines = [`(sharing ${author} message from ${link})`];
+	const quote = (text: string) => lines.push(...text.split("\n").map((line) => `> ${line}`));
+	if (target.content) quote(target.content);
+	for (const embed of target.embeds) {
+		const text = [embed.title, embed.description].filter(Boolean).join("\n");
+		if (text) quote(`[embed] ${text}`);
+	}
+	const files: IncomingFile[] =
+		target instanceof Message
+			? [...target.attachments.values()].map((a) => ({ url: a.url, name: a.name, contentType: a.contentType }))
+			: target.attachments.map((a) => ({ url: a.url, name: a.filename, contentType: a.content_type }));
+	return { lines, files };
+}
+
+function shareModal(customId: string, title: string, label: string): ModalBuilder {
+	return new ModalBuilder()
+		.setCustomId(customId)
+		.setTitle(title)
+		.addLabelComponents(
+			new LabelBuilder()
+				.setLabel(label)
+				.setTextInputComponent(
+					new TextInputBuilder().setCustomId(MODAL_TEXT).setStyle(TextInputStyle.Paragraph).setRequired(false),
+				),
+			new LabelBuilder()
+				.setLabel("Files")
+				.setDescription("Screenshots, logs or anything else")
+				.setFileUploadComponent(new FileUploadBuilder().setCustomId(MODAL_FILES).setRequired(false).setMaxValues(10)),
+		);
+}
+
+/** Register /yo and "Send to pi". Returns whether they work outside servers the bot is in. */
+async function registerCommands(client: Client): Promise<boolean> {
+	const app = await client.application!.fetch();
+	const userInstall = app.integrationTypesConfig?.[ApplicationIntegrationType.UserInstall] != null;
+	const types = userInstall
+		? [ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall]
+		: [ApplicationIntegrationType.GuildInstall];
+	const contexts = userInstall
+		? [InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel]
+		: [InteractionContextType.Guild, InteractionContextType.BotDM];
+	const commands: ApplicationCommandData[] = [
+		{
+			type: ApplicationCommandType.ChatInput,
+			name: YO_COMMAND,
+			description: "Send pi a message or files. It replies in your DM",
+			integrationTypes: types,
+			contexts,
+		},
+		{ type: ApplicationCommandType.Message, name: SHARE_COMMAND, integrationTypes: types, contexts },
+	];
+	const existing = await app.commands.fetch();
+	if (existing.size !== commands.length || !commands.every((c) => existing.some((e) => e.equals(c)))) {
+		await app.commands.set(commands);
+	}
+	return userInstall;
+}
+
 function expandPath(path: string, cwd: string): string {
 	if (path === "~" || path.startsWith("~/")) return join(homedir(), path.slice(1));
 	return resolve(cwd, path);
@@ -195,6 +291,7 @@ export default function (pi: ExtensionAPI) {
 	let dm: DMChannel | undefined;
 	let connecting: Promise<void> | undefined;
 	let ctxRef: ExtensionContext | undefined;
+	let userInstallable = false; // /yo works in servers the bot isn't in
 
 	// Reply routing state
 	let armed = false;
@@ -498,6 +595,33 @@ export default function (pi: ExtensionAPI) {
 
 	// --- inbound Discord messages ----------------------------------------------
 
+	/** Save files to the inbox. Pi gets their paths, and images inline. */
+	const download = async (files: IncomingFile[], id: string) => {
+		const lines: string[] = [];
+		const images: ImageContent[] = [];
+		for (const file of files) {
+			const response = await fetch(file.url);
+			if (!response.ok) continue;
+			const data = Buffer.from(await response.arrayBuffer());
+			mkdirSync(INBOX_DIR, { recursive: true });
+			const path = join(INBOX_DIR, `${id}-${basename(file.name).replace(/[^\w.-]/g, "_")}`);
+			writeFileSync(path, data);
+			lines.push(`[attachment: ${path}]`);
+			const mimeType = file.contentType?.split(";")[0];
+			if (mimeType?.startsWith("image/")) images.push({ type: "image", data: data.toString("base64"), mimeType });
+		}
+		return { lines, images };
+	};
+
+	const sendToPi = (lines: string[], images: ImageContent[]) => {
+		const body = `${PREFIX} ${lines.join("\n")}`;
+		startTyping();
+		// Like pressing Enter in the TUI: starts a run when idle, steers when busy.
+		deliver(() =>
+			pi.sendUserMessage(images.length > 0 ? [{ type: "text", text: body }, ...images] : body, { deliverAs: "steer" }),
+		);
+	};
+
 	const onDiscordMessage = async (message: Message, userId: string) => {
 		if (message.author.id !== userId || message.guildId) return;
 		const ctx = ctxRef;
@@ -520,26 +644,68 @@ export default function (pi: ExtensionAPI) {
 			const quoted = await message.fetchReference().catch(() => undefined);
 			if (quoted) lines.unshift(describeReply(quoted, quoted.author.id === message.client.user.id));
 		}
-		const images: ImageContent[] = [];
-		for (const attachment of message.attachments.values()) {
-			const response = await fetch(attachment.url);
-			if (!response.ok) continue;
-			const data = Buffer.from(await response.arrayBuffer());
-			mkdirSync(INBOX_DIR, { recursive: true });
-			const path = join(INBOX_DIR, `${message.id}-${basename(attachment.name).replace(/[^\w.-]/g, "_")}`);
-			writeFileSync(path, data);
-			lines.push(`[attachment: ${path}]`);
-			const mimeType = attachment.contentType?.split(";")[0];
-			if (mimeType?.startsWith("image/")) images.push({ type: "image", data: data.toString("base64"), mimeType });
-		}
+		const files = [...message.attachments.values()].map((a) => ({ url: a.url, name: a.name, contentType: a.contentType }));
+		const saved = await download(files, message.id);
+		lines.push(...saved.lines);
 		if (lines.length === 0) return;
+		sendToPi(lines, saved.images);
+	};
 
-		const body = `${PREFIX} ${lines.join("\n")}`;
-		startTyping();
-		// Like pressing Enter in the TUI: starts a run when idle, steers when busy.
-		deliver(() =>
-			pi.sendUserMessage(images.length > 0 ? [{ type: "text", text: body }, ...images] : body, { deliverAs: "steer" }),
-		);
+	// --- /yo and "Send to pi" ------------------------------------------------------
+
+	// Messages picked with "Send to pi", waiting for their modal.
+	const shares = new Map<string, { lines: string[]; files: IncomingFile[] }>();
+
+	const onInteraction = async (interaction: Interaction, userId: string) => {
+		if (!interaction.isChatInputCommand() && !interaction.isMessageContextMenuCommand() && !interaction.isModalSubmit()) {
+			return;
+		}
+		if (interaction.user.id !== userId) {
+			await interaction.reply({ content: "This pi only takes messages from its owner.", flags: MessageFlags.Ephemeral });
+			return;
+		}
+		const inDm = interaction.channelId === dm?.id;
+		const here = `https://discord.com/channels/${interaction.guildId ?? "@me"}/${interaction.channelId}`;
+
+		if (interaction.isChatInputCommand()) {
+			if (interaction.commandName === YO_COMMAND) await interaction.showModal(shareModal(YO_COMMAND, "Message pi", "Message"));
+			return;
+		}
+
+		if (interaction.isMessageContextMenuCommand()) {
+			if (interaction.commandName !== SHARE_COMMAND) return;
+			const target = interaction.targetMessage as Message | APIMessage;
+			const customId = `${SHARE_PREFIX}${interaction.id}`;
+			shares.set(customId, describeShared(target, `${here}/${target.id}`, userId, interaction.client.user.id));
+			setTimeout(() => shares.delete(customId), SHARE_TTL_MS).unref();
+			await interaction.showModal(shareModal(customId, "Send to pi", "Note (optional)"));
+			return;
+		}
+
+		const share =
+			interaction.customId === YO_COMMAND
+				? { lines: inDm ? [] : [`(sent with /yo from ${here})`], files: [] }
+				: shares.get(interaction.customId);
+		shares.delete(interaction.customId);
+		if (!share) {
+			await interaction.reply({ content: "That took too long. Try again.", flags: MessageFlags.Ephemeral });
+			return;
+		}
+		const text = interaction.fields.getTextInputValue(MODAL_TEXT).trim();
+		const uploads = [...(interaction.fields.getUploadedFiles(MODAL_FILES)?.values() ?? [])];
+		const files = [...share.files, ...uploads.map((a) => ({ url: a.url, name: a.name, contentType: a.contentType }))];
+		const lines = [...share.lines, ...(text ? [text] : [])];
+		if (!text && files.length === 0 && interaction.customId === YO_COMMAND) {
+			await interaction.reply({ content: "Nothing to send.", flags: MessageFlags.Ephemeral });
+			return;
+		}
+		// Reply within Discord's 3 seconds; downloads can take longer.
+		await interaction.reply({
+			content: inDm || !dm ? "-# Sent to pi" : `-# Sent to pi · [replies in your DM](https://discord.com/channels/@me/${dm.id})`,
+			flags: MessageFlags.Ephemeral,
+		});
+		const saved = await download(files, interaction.id);
+		sendToPi([...lines, ...saved.lines], saved.images);
 	};
 
 	// --- connection lifecycle ----------------------------------------------------
@@ -565,6 +731,11 @@ export default function (pi: ExtensionAPI) {
 					ctxRef?.ui.notify(`discord: ${(err as Error).message}`, "error"),
 				);
 			});
+			next.on(Events.InteractionCreate, (interaction) => {
+				onInteraction(interaction, userId).catch((err) =>
+					ctxRef?.ui.notify(`discord: ${(err as Error).message}`, "error"),
+				);
+			});
 			next.on(Events.Error, (err) => ctxRef?.ui.notify(`discord: ${err.message}`, "error"));
 
 			try {
@@ -572,6 +743,10 @@ export default function (pi: ExtensionAPI) {
 				await ready;
 				const user = await next.users.fetch(userId);
 				dm = await user.createDM();
+				userInstallable = await registerCommands(next).catch((err) => {
+					ctx.ui.notify(`discord: couldn't register /yo: ${(err as Error).message}`, "warning");
+					return false;
+				});
 				client = next;
 				writeLock();
 				watchFile(LOCK_FILE, { interval: 1000 }, onLockChange);
@@ -628,6 +803,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			`User messages beginning with ${PREFIX} were sent from the user's Discord DM. Your assistant text while answering them is forwarded to that DM automatically, so reply naturally, like texting. Don't use a tool to send text.`,
 			`If a reply to a ${PREFIX} message needs no Discord message, make that text exactly [silent].`,
+			`${PREFIX} messages that mention /yo or sharing a message came from another Discord channel, identified by its link. Your reply still goes to the DM, since this bot can't post there.`,
 			`Use ${TOOL_NAME} to send files such as screenshots, images, logs or documents to the Discord DM. Discord renders Markdown but not tables.`,
 		],
 		parameters: Type.Object({
@@ -679,7 +855,12 @@ export default function (pi: ExtensionAPI) {
 				try {
 					await connect(ctx);
 					pi.appendEntry(ENTRY_TYPE, { enabled: true });
-					ctx.ui.notify("Discord DM connected", "info");
+					ctx.ui.notify(
+						userInstallable
+							? "Discord DM connected"
+							: "Discord DM connected. Turn on User Install for the bot to use /yo in other servers",
+						"info",
+					);
 				} catch (err) {
 					ctx.ui.notify(`discord: ${(err as Error).message}`, "error");
 				}
@@ -705,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "status") {
 				const holder = otherLockHolder();
 				const state = client
-					? `connected (${client.user?.tag})${armed ? ", replying to Discord" : ""}`
+					? `connected (${client.user?.tag})${armed ? ", replying to Discord" : ""}${userInstallable ? "" : ", /yo only where the bot is"}`
 					: holder
 						? `owned by pi process ${holder}`
 						: "disconnected";

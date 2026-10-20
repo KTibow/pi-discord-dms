@@ -2,7 +2,8 @@
 
 Text one pi session from one Discord DM. Pi's replies come back as ordinary messages. A live
 status line shows how many tools it has called and which one ran last. Pi can also send you
-files.
+files. From any other channel, `/yo` and the **Send to pi** message action pass things to pi
+without its reply showing up there.
 
 ## Setup
 
@@ -11,6 +12,10 @@ files.
 2. **Let the bot DM you.** The bot can only DM you if you share a server with it. Under OAuth2 →
    URL Generator, tick `bot`, open the generated URL and add the bot to any server you're in. A
    private server of your own works.
+
+   To use `/yo` and **Send to pi** in servers the bot isn't in, open Installation, tick
+   **User Install** under Installation Contexts and save. Then open the Discord Provided Link
+   and choose **Add to My Apps**.
 3. **Get your user ID.** In Discord, turn on Settings → Advanced → Developer Mode, then
    right-click your name and choose Copy User ID.
 4. **Install:**
@@ -41,9 +46,23 @@ instead. The environment variables take priority over the file.
 | Discord | `!stop` | Abort the current run |
 | Discord | `./command args` | Run a pi slash command. See below |
 | Discord | attachments | Saved under `~/.pi/agent/discord-dms/inbox/`. Pi gets the file paths, and images are also sent inline |
+| any channel | `/yo` | Opens a form for a message and files. Pi gets them with a link to the channel |
+| any channel | message → Apps → **Send to pi** | Opens a form for an optional note and files. Pi gets the message's text, attachments and link |
 
 Pi rejects new prompts while a manual compaction or branch summary is running. Messages you send
 during one wait and go through once it finishes, as they do when typed in the TUI.
+
+### Sending from other channels
+
+`/yo` and **Send to pi** work in servers, group DMs and other DMs. Only you can see the
+"Sent to pi" confirmation, and pi's reply comes to the bot's DM like any other. Pi gets a
+`discord.com/channels/...` link to where you sent it from. If pi can read that server some other
+way, such as through another bot, it can use the link to look around. Otherwise it only has what
+you sent.
+
+The bot registers both commands when it connects. Without User Install they only work in
+servers the bot is in, and `/discord status` says so. New commands can take a minute to appear,
+or a Discord restart.
 
 ### Slash commands from Discord
 
