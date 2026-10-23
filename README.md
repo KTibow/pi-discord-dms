@@ -2,8 +2,8 @@
 
 Text one pi session from one Discord DM. Pi's replies come back as ordinary messages. A live
 status line shows how many tools it has called and which one ran last. Pi can also send you
-files. From any other channel, `/yo` and the **Send to pi** message action pass things to pi
-without its reply showing up there.
+files. From any other channel, `/yo` and the **Send to pi** message action pass things to pi,
+and pi's answer can be posted back there.
 
 ## Setup
 
@@ -46,8 +46,8 @@ instead. The environment variables take priority over the file.
 | Discord | `!stop` | Abort the current run |
 | Discord | `./command args` | Run a pi slash command. See below |
 | Discord | attachments | Saved under `~/.pi/agent/discord-dms/inbox/`. Pi gets the file paths, and images are also sent inline |
-| any channel | `/yo` | Opens a form for a message and files. Pi gets them with a link to the channel |
-| any channel | message → Apps → **Send to pi** | Opens a form for an optional note and files. Pi gets the message's text, attachments and link |
+| any channel | `/yo` | Opens a form for a message and files. Pi gets them with a link to the channel, and its answer can be posted there |
+| any channel | message → Apps → **Send to pi** | Opens a form for an optional note and files. Pi gets the message's text, attachments and link, and its answer can be posted there as a reply |
 
 Pi rejects new prompts while a manual compaction or branch summary is running. Messages you send
 during one wait and go through once it finishes, as they do when typed in the TUI.
@@ -59,6 +59,22 @@ during one wait and go through once it finishes, as they do when typed in the TU
 server and channel IDs and a link to where you sent it from. If pi can read that server some
 other way, such as through another bot, it's told to check before saying it can't. Note in
 AGENTS.md which access goes with which server ID, and how to use it.
+
+When pi finishes, "Sent to pi" turns into a preview of its final answer with a **Post** button.
+Post sends the answer to the channel, with any files pi sent during that run. After **Send to
+pi** it shows as a reply to the message you shared. After `/yo` it replies to the "Sent to pi"
+message, which others see as "Original message was deleted". Nobody gets pinged.
+
+Tick **Post the answer here automatically** in the form to skip the preview. Before posting, a
+Jev classifier checks that the answer doesn't look private, using the first of the classifiers
+[pi-safety](https://github.com/KTibow/pi-safety) tries that has credentials. If it rates the
+answer 30% or more likely to be private, or no classifier is available, you get the preview
+instead. Runs that end in an error or `!stop` always get the preview.
+
+Discord only lets the bot update "Sent to pi" for 15 minutes after you send something. If pi
+takes longer, there's no preview: the DM says it was too late, and you can forward pi's reply
+yourself. A preview you got in time can still be posted later. Servers can stop external apps from
+posting publicly, and then only you see the post.
 
 The bot registers both commands when it connects. Without User Install they only work in
 servers the bot is in, and `/discord status` says so. New commands can take a minute to appear,
