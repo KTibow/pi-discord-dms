@@ -44,6 +44,7 @@ import {
 	ModalBuilder,
 	type ModalSubmitInteraction,
 	Partials,
+	PermissionFlagsBits,
 	TextInputBuilder,
 	TextInputStyle,
 } from "discord.js";
@@ -313,6 +314,16 @@ function shareModal(customId: string, title: string, label: string, postable: bo
 	return modal;
 }
 
+/**
+ * Whether a public reply here stays public. A server can deny its members Use External Apps,
+ * and then replies from apps it hasn't installed itself show only to the user.
+ */
+function canPostPublicly(interaction: Interaction): boolean {
+	if (!interaction.guildId) return true;
+	if (interaction.authorizingIntegrationOwners[ApplicationIntegrationType.GuildInstall] === interaction.guildId) return true;
+	return interaction.memberPermissions?.has(PermissionFlagsBits.UseExternalApps) ?? true;
+}
+
 /** Preview of an answer, sized to fit one message next to its note. */
 function previewText(answer: string, files: string[], note: string): string {
 	const body = answer.length > PREVIEW_CHARS ? `${answer.slice(0, PREVIEW_CHARS)}…` : answer;
@@ -546,14 +557,16 @@ export default function (pi: ExtensionAPI) {
 		if (!via) throw new Error("the 15 minutes to post there ran out");
 		const chunks = chunkText(origin.answer ?? "").slice(0, MAX_FOLLOWUPS);
 		const files = origin.files.map((f) => new AttachmentBuilder(f));
-		let first: string | undefined;
+		let first: Message | undefined;
 		for (let i = 0; i < chunks.length; i++) {
 			const last = i === chunks.length - 1;
 			const sent = await via.followUp({ content: chunks[i], files: last ? files : [], allowedMentions: { parse: [] } });
-			first ??= sent.id;
+			first ??= sent;
 		}
 		origin.posted = true;
-		void note(`[posted](${origin.link}/${first}) pi's answer`);
+		// Permissions can change after the form was opened; Discord then hides the post.
+		if (first?.flags.has(MessageFlags.Ephemeral)) void note(`only you can see the post: apps can't post publicly [there](${origin.link})`);
+		else void note(`[posted](${origin.link}/${first?.id}) pi's answer`);
 	};
 
 	const postButton = (origin: Origin) =>
@@ -842,6 +855,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const inDm = interaction.channelId === dm?.id;
+		const postable = !inDm && canPostPublicly(interaction);
 		const here = `https://discord.com/channels/${interaction.guildId ?? "@me"}/${interaction.channelId}`;
 		const place = interaction.guildId
 			? `server ${interaction.guildId}, channel ${interaction.channelId}`
@@ -856,7 +870,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (interaction.isChatInputCommand()) {
 			if (interaction.commandName === YO_COMMAND) {
-				await interaction.showModal(shareModal(YO_COMMAND, "Message pi", "Message", !inDm));
+				await interaction.showModal(shareModal(YO_COMMAND, "Message pi", "Message", postable));
 			}
 			return;
 		}
@@ -867,7 +881,7 @@ export default function (pi: ExtensionAPI) {
 			const customId = `${SHARE_PREFIX}${interaction.id}`;
 			shares.set(customId, describeShared(target, `${place}: ${here}/${target.id}`, userId, interaction.client.user.id));
 			setTimeout(() => shares.delete(customId), SHARE_TTL_MS).unref();
-			await interaction.showModal(shareModal(customId, "Send to pi", "Note (optional)", !inDm));
+			await interaction.showModal(shareModal(customId, "Send to pi", "Note (optional)", postable));
 			return;
 		}
 
@@ -888,20 +902,22 @@ export default function (pi: ExtensionAPI) {
 			await interaction.reply({ content: "Nothing to send.", flags: MessageFlags.Ephemeral });
 			return;
 		}
-		const autopost = !inDm && interaction.fields.getCheckbox(MODAL_AUTOPOST);
+		const autopost = postable && interaction.fields.getCheckbox(MODAL_AUTOPOST);
 		const dmLink = dm && `https://discord.com/channels/@me/${dm.id}`;
 		// Reply within Discord's 3 seconds; downloads can take longer.
 		await interaction.reply({
 			content:
 				inDm || !dmLink
 					? "-# Sent to pi"
-					: autopost
-						? `-# Sent to pi · its answer gets posted here · [follow along in your DM](${dmLink})`
-						: `-# Sent to pi · [replies in your DM](${dmLink})`,
+					: !postable
+						? `-# Sent to pi · this channel doesn't allow app posts · [replies in your DM](${dmLink})`
+						: autopost
+							? `-# Sent to pi · its answer gets posted here · [follow along in your DM](${dmLink})`
+							: `-# Sent to pi · [replies in your DM](${dmLink})`,
 			flags: MessageFlags.Ephemeral,
 		});
 		let origin: Origin | undefined;
-		if (!inDm) {
+		if (postable) {
 			origin = {
 				id: interaction.id,
 				interaction,

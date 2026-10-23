@@ -73,8 +73,9 @@ instead. Runs that end in an error or `!stop` always get the preview.
 
 Discord only lets the bot update "Sent to pi" for 15 minutes after you send something. If pi
 takes longer, there's no preview: the DM says it was too late, and you can forward pi's reply
-yourself. A preview you got in time can still be posted later. Servers can stop external apps from
-posting publicly, and then only you see the post.
+yourself. A preview you got in time can still be posted later. Servers can deny Use External Apps
+to stop apps they haven't installed from posting publicly. Where it's denied for you, the form
+doesn't offer posting and "Sent to pi" says so.
 
 The bot registers both commands when it connects. Without User Install they only work in
 servers the bot is in, and `/discord status` says so. New commands can take a minute to appear,
