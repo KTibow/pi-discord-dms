@@ -123,6 +123,8 @@ interface Origin {
 	at: number;
 	autopost: boolean;
 	place: string;
+	/** The channel's URL, for notes in the DM. */
+	link: string;
 	request: string;
 	answer?: string;
 	files: string[];
@@ -471,7 +473,7 @@ export default function (pi: ExtensionAPI) {
 	const finishRun = () => {
 		armed = false;
 		for (const origin of runOrigins) {
-			settleOrigin(origin).catch((err) => void note(`couldn't post to ${origin.place}: ${(err as Error).message}`));
+			settleOrigin(origin).catch((err) => void note(`couldn't post [there](${origin.link}): ${(err as Error).message}`));
 		}
 		runOrigins = [];
 		if (statusTimer) clearTimeout(statusTimer);
@@ -544,12 +546,14 @@ export default function (pi: ExtensionAPI) {
 		if (!via) throw new Error("the 15 minutes to post there ran out");
 		const chunks = chunkText(origin.answer ?? "").slice(0, MAX_FOLLOWUPS);
 		const files = origin.files.map((f) => new AttachmentBuilder(f));
+		let first: string | undefined;
 		for (let i = 0; i < chunks.length; i++) {
 			const last = i === chunks.length - 1;
-			await via.followUp({ content: chunks[i], files: last ? files : [], allowedMentions: { parse: [] } });
+			const sent = await via.followUp({ content: chunks[i], files: last ? files : [], allowedMentions: { parse: [] } });
+			first ??= sent.id;
 		}
 		origin.posted = true;
-		void note(`posted to ${origin.place}`);
+		void note(`[posted](${origin.link}/${first}) pi's answer`);
 	};
 
 	const postButton = (origin: Origin) =>
@@ -564,7 +568,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (Date.now() - origin.at >= TOKEN_TTL_MS) {
-			void note(`too late to post in ${origin.place}; forward pi's reply instead`);
+			void note(`too late to post [there](${origin.link}); forward pi's reply instead`);
 			return;
 		}
 		const reason = origin.autopost ? await holdReason(origin).catch((err) => (err as Error).message) : undefined;
@@ -884,20 +888,27 @@ export default function (pi: ExtensionAPI) {
 			await interaction.reply({ content: "Nothing to send.", flags: MessageFlags.Ephemeral });
 			return;
 		}
+		const autopost = !inDm && interaction.fields.getCheckbox(MODAL_AUTOPOST);
+		const dmLink = dm && `https://discord.com/channels/@me/${dm.id}`;
 		// Reply within Discord's 3 seconds; downloads can take longer.
 		await interaction.reply({
-			content: inDm || !dm ? "-# Sent to pi" : `-# Sent to pi · [replies in your DM](https://discord.com/channels/@me/${dm.id})`,
+			content:
+				inDm || !dmLink
+					? "-# Sent to pi"
+					: autopost
+						? `-# Sent to pi · its answer gets posted here · [follow along in your DM](${dmLink})`
+						: `-# Sent to pi · [replies in your DM](${dmLink})`,
 			flags: MessageFlags.Ephemeral,
 		});
 		let origin: Origin | undefined;
 		if (!inDm) {
-			const autopost = interaction.fields.getCheckbox(MODAL_AUTOPOST);
 			origin = {
 				id: interaction.id,
 				interaction,
 				at: Date.now(),
 				autopost,
 				place,
+				link: here,
 				request: lines.join("\n"),
 				files: [],
 				posted: false,
