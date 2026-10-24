@@ -7,7 +7,7 @@
 
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
-import { AttachmentBuilder, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder } from "discord.js";
+import { AttachmentBuilder, escapeMarkdown, SectionBuilder, TextDisplayBuilder, ThumbnailBuilder } from "discord.js";
 
 const ICONS = { running: "⏳", done: "✅", error: "❌" } as const;
 const MAX_LINES = 20;
@@ -61,10 +61,15 @@ function plural(count: number, noun: string): string {
 	return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-/** Text squeezed onto one line, safe inside inline code. */
+/** Text squeezed onto one line. */
 export function oneLine(text: string, max = WIDTH): string {
-	const line = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
+	const line = text.replace(/\s+/g, " ").trim();
 	return line.length > max ? `${line.slice(0, max - 3)}…` : line;
+}
+
+/** Inline code showing `text` exactly, even when it contains backticks. */
+function code(text: string): string {
+	return text.includes("`") ? `\`\` ${text} \`\`` : `\`${text}\``;
 }
 
 /** The latest sentence or line long enough to say something, so a short or unfinished one doesn't flicker. */
@@ -74,7 +79,7 @@ export function describeThought(thinking: string): string {
 		.map((s) => s.trim())
 		.filter(Boolean);
 	const thought = oneLine(sentences.findLast((s) => s.length >= 40) ?? sentences.at(-1) ?? "");
-	return thought ? `💭 \`${thought}\`` : "💭";
+	return thought ? `💭 *${escapeMarkdown(thought)}*` : "💭";
 }
 
 /** A path relative to cwd when inside it, else with ~ for home. */
@@ -85,56 +90,57 @@ function tidyPath(path: string, cwd: string): string {
 	return absolute === HOME || absolute.startsWith(`${HOME}/`) ? `~${absolute.slice(HOME.length)}` : absolute;
 }
 
-/** The directory a command starts with `cd dir &&` into, and the rest without wrappers like `timeout 30`. */
+/** The directory a command starts with `cd dir &&` into, and the rest of it. */
 function unwrap(command: string): { dir?: string; rest: string } {
 	const cd = command.match(/^\s*cd\s+("[^"]*"|'[^']*'|\S+)\s*(?:&&|;|\n)\s*/);
 	const dir = cd?.[1].replace(/^["']|["']$/g, "").replace(/\/+$/, "");
-	const rest = (cd ? command.slice(cd[0].length) : command).trim().replace(/^timeout\s+\S+\s+/, "");
-	return { dir, rest };
+	return { dir, rest: (cd ? command.slice(cd[0].length) : command).trim() };
+}
+
+/** Text as typed, on one line, with its line breaks shown as ⏎. */
+function verbatim(text: string): string {
+	return text
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.join(" ⏎ ");
 }
 
 const SCRIPT_LANGS: Record<string, string> = { python: "py", node: "js", deno: "ts", bun: "ts", bash: "sh", sh: "sh", zsh: "sh", ruby: "rb", perl: "pl" };
-/** Script lines that say little about what it does. */
-const BOILERPLATE = /^(#|\/\/|import\s|from\s+\S+\s+import\s|(const|let|var)\s+.+=\s*require\(|["']use strict["'])/;
 
-/** Lines of a command or script on one line, separated as the shell would read them. */
-function joinLines(lines: string[]): string {
-	let joined = "";
-	for (const line of lines.map((l) => l.trim()).filter(Boolean)) {
-		const continues = !joined || /(\\|\|\||&&|[|({]|\b(do|then|else|in))$/.test(joined);
-		joined = continues ? `${joined.replace(/\\$/, "")} ${line}`.trim() : `${joined.replace(/;$/, "")}; ${line}`;
-	}
-	return joined.replace(/;$/, "");
-}
-
-/** A command that feeds in a script with `<<EOF`: the command, the script and its language. */
-function heredoc(command: string): { head: string; body: string[]; lang: string } | undefined {
+/** A command that feeds in a script with `<<EOF`: its first line, the script, and what reads it. */
+function heredoc(command: string) {
 	const [first, ...rest] = command.split("\n");
-	const marker = first.match(/\s*<<-?\s*(['"]?)(\w+)\1/);
+	const marker = first.match(/<<-?\s*(['"]?)(\w+)\1/);
 	if (!marker) return undefined;
 	const end = rest.findIndex((line) => line.trim() === marker[2]);
-	const head = first.replace(marker[0], "").replace(/\s+-(?=\s|$)/, "").trim();
-	const target = head.match(/>\s*(\S+)$/)?.[1];
-	const program = basename(head.split(/\s+/)[0]).replace(/[\d.]+$/, "");
+	const reader = first.slice(0, marker.index).trim().replace(/^timeout\s+\S+\s+/, "");
+	const target = reader.match(/>\s*(\S+)$/)?.[1];
+	const program = basename(reader.split(/\s+/)[0]).replace(/[\d.]+$/, "");
 	const lang = target ? extname(target).slice(1) : (SCRIPT_LANGS[program] ?? "");
-	return { head, body: end === -1 ? rest : rest.slice(0, end), lang };
+	return { first: first.trim(), body: end === -1 ? rest : rest.slice(0, end), target, program, lang };
+}
+
+/** What a script fed to a program is, in words: its size and, given `room`, the first path or URL it names. */
+function describeScript(script: NonNullable<ReturnType<typeof heredoc>>, room: number): string {
+	const lines = script.body.filter((line) => line.trim()).length;
+	if (script.target) return plural(lines, "line");
+	const what = `${lines}-line ${script.program || "inline"} script`;
+	const name = script.body.join("\n").match(/(?:https?:\/\/|~?\/|\.\/)[^\s'"`)\],;]+/)?.[0];
+	return name && room - what.length >= 20 ? `${what} · ${escapeMarkdown(oneLine(name, room - what.length - 3))}` : what;
 }
 
 /**
- * A command as a prompt line. A leading `cd dir &&` becomes the prompt, unless it's into pi's
- * own directory. A script fed in with `<<EOF` shows its telling lines.
+ * A command as typed, after a prompt: a leading `cd dir &&` becomes the prompt, unless it's
+ * into pi's own directory. A script fed in with `<<EOF` is described rather than shown.
  */
 function describeCommand(command: string, cwd: string): string {
 	const { dir, rest } = unwrap(command);
 	const away = dir !== undefined && resolve(cwd, dir.replace(/^~(?=\/|$)/, HOME)) !== resolve(cwd);
 	const prompt = away ? `${basename(dir) || dir} $` : "$";
 	const script = heredoc(rest);
-	let text = joinLines(rest.split("\n"));
-	if (script) {
-		const telling = script.body.filter((line) => !BOILERPLATE.test(line.trim()));
-		text = `${script.head} << ${joinLines(telling.some((line) => line.trim()) ? telling : script.body)}`;
-	}
-	return `\`${oneLine(`${prompt} ${text.replaceAll(HOME, "~")}`)}\``;
+	const typed = oneLine(`${prompt} ${verbatim(script ? script.first : rest)}`);
+	return script ? `${code(typed)} · ${describeScript(script, WIDTH - typed.length - 3)}` : code(typed);
 }
 
 function patchStats(patch: string): string {
@@ -147,7 +153,7 @@ function patchStats(patch: string): string {
 /** One line for a call, from its name and (possibly partial) arguments. */
 export function describeCall(name: string, args: Record<string, unknown>, cwd: string, patch?: string): string {
 	const rawPath = args.path ?? args.file_path;
-	const path = typeof rawPath === "string" && rawPath ? `\`${oneLine(tidyPath(rawPath, cwd))}\`` : "";
+	const path = typeof rawPath === "string" && rawPath ? code(oneLine(tidyPath(rawPath, cwd))) : "";
 	if (name === "bash" && typeof args.command === "string") return describeCommand(args.command, cwd);
 	if (name === "read" && path) {
 		const offset = typeof args.offset === "number" ? args.offset : undefined;
@@ -161,11 +167,11 @@ export function describeCall(name: string, args: Record<string, unknown>, cwd: s
 	if (name === "write" && path && typeof args.content === "string") {
 		return `**write** ${path} · ${plural(args.content.split("\n").length, "line")}`;
 	}
-	const key = ["command", "path", "file_path", "pattern", "query", "url", "paths"].find((k) => args[k] !== undefined);
+	const key = ["command", "code", "path", "file_path", "pattern", "query", "url", "paths"].find((k) => args[k] !== undefined);
 	let detail = key ? args[key] : Object.keys(args).length > 0 ? args : "";
 	if (typeof detail !== "string") detail = JSON.stringify(detail);
-	const summary = oneLine(detail as string);
-	return summary ? `**${name}** \`${summary}\`` : `**${name}**`;
+	const summary = oneLine(verbatim(detail as string));
+	return summary ? `**${name}** ${code(summary)}` : `**${name}**`;
 }
 
 function duration(ms: number): string {
@@ -186,9 +192,9 @@ function outputLines(output: string): { lines: string[]; code?: string } {
 
 /** Why a call failed, in one line: its exit code and last line of output. */
 function failure(tool: ToolLine): string {
-	const { lines, code } = outputLines(tool.output ?? "");
+	const { lines, code: exit } = outputLines(tool.output ?? "");
 	const reason = (tool.name === "bash" ? lines.findLast((l) => l.trim()) : lines.find((l) => l.trim())) ?? "";
-	const parts = [code && `exit ${code}`, reason && `\`${oneLine(reason, 80)}\``].filter(Boolean);
+	const parts = [exit && `exit ${exit}`, reason && code(oneLine(reason, 80))].filter(Boolean);
 	return parts.length > 0 ? `\n-# ${parts.join(" · ")}` : "";
 }
 
