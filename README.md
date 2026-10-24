@@ -115,7 +115,8 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
   shows its last lines of output, its diff or the start of the file it wrote. The latest image pi
   read appears beside its line. Between tool calls, one more line shows what pi is thinking or
   which tool call it's writing, and it goes away once pi acts. After pi posts text, the next tool
-  call moves the status message below it. It shows `✓` when the run ends.
+  call moves the status message below it. When the run ends, it shows `✓` and the total time, and
+  keeps one line per call: the output, diff, image and thinking lines go away.
 - A reply that is empty or exactly `[silent]` is not posted. Errors and aborts are posted.
 - The bridge **disarms** when the agent settles, meaning no retries, compactions or queued
   messages remain. It also disarms when a user message that didn't come from Discord enters the

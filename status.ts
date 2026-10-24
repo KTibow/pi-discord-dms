@@ -42,7 +42,9 @@ export interface Status {
 	tools: ToolLine[];
 	/** What pi is doing before its next tool call. */
 	pending?: { key: string; text: string; since: number };
-	done: boolean;
+	since: number;
+	/** When the run ended. A finished status keeps one line per call and drops what was live. */
+	doneAt?: number;
 }
 
 /** Status text, split around the section that shows the latest image. */
@@ -202,14 +204,21 @@ function preview(tool: ToolLine): string | undefined {
 
 /** The status message as text, newest calls winning when it would run past `maxChars`. */
 export function renderStatus(status: Status, cwd: string, maxChars: number, images = true): StatusView {
-	const { tools, pending, done } = status;
+	const { tools, pending, doneAt } = status;
+	const done = doneAt !== undefined;
 	const failed = tools.filter((tool) => tool.state === "error").length;
-	const header = `-# ${done ? "✓" : "🔧"} ${plural(tools.length, "tool call")}${failed ? ` · ${failed} failed` : ""}`;
+	const header = [
+		`-# ${done ? "✓" : "🔧"} ${plural(tools.length, "tool call")}`,
+		failed && `${failed} failed`,
+		done && duration(doneAt - status.since),
+	]
+		.filter(Boolean)
+		.join(" · ");
 	// Discord keeps these counting up, so live lines need no edits to show how long they've taken.
 	const ago = (since: number) => ` · <t:${Math.floor(since / 1000)}:R>`;
 
 	const last = tools.at(-1);
-	const extra = last && preview(last);
+	const extra = last && !done ? preview(last) : undefined;
 	const lines = tools.map((tool) => {
 		let line = `${ICONS[tool.state]} ${describeCall(tool.name, tool.args, cwd, tool.patch)}`;
 		if (tool.state === "running" && !done) line += ago(tool.since);
@@ -227,7 +236,7 @@ export function renderStatus(status: Status, cwd: string, maxChars: number, imag
 	const head = [header, ...(first > 0 ? [`-# … ${first} earlier`] : [])];
 	const join = (parts: (string | undefined)[]) => parts.filter(Boolean).join("\n");
 
-	const imageAt = images ? tools.findLastIndex((tool) => tool.image) : -1;
+	const imageAt = images && !done ? tools.findLastIndex((tool) => tool.image) : -1;
 	const image = tools[imageAt]?.image;
 	if (!image || imageAt < first) return { before: join([...head, ...lines.slice(first), tail]), after: "" };
 	const start = Math.max(first, imageAt - IMAGE_CONTEXT);

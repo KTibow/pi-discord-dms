@@ -586,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 	let runOrigins: Origin[] = [];
 
 	// Tool-call status message: one live message per armed run, reposted below new text.
-	const status: Status = { tools: [], done: false };
+	const status: Status = { tools: [], since: Date.now() };
 	let statusMsg: Message | undefined;
 	let statusImage: string | undefined; // the image statusMsg has attached
 	let statusStale = false; // text was posted after the status message
@@ -681,7 +681,8 @@ export default function (pi: ExtensionAPI) {
 	const resetRun = () => {
 		status.tools = [];
 		status.pending = undefined;
-		status.done = false;
+		status.since = Date.now();
+		status.doneAt = undefined;
 		statusMsg = undefined;
 		statusImage = undefined;
 		statusStale = false;
@@ -699,7 +700,7 @@ export default function (pi: ExtensionAPI) {
 		statusTimer = undefined;
 		enqueue(async () => {
 			if (status.tools.length > 0) {
-				status.done = true;
+				status.doneAt = Date.now();
 				statusDirty = true;
 				statusStale = false; // finalize in place rather than reposting
 				await flushStatus();
