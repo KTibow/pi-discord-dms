@@ -21,6 +21,7 @@ import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, unwatchFile, 
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
 	ActionRowBuilder,
@@ -55,6 +56,7 @@ import {
 	TextInputBuilder,
 	TextInputStyle,
 } from "discord.js";
+import { describeCall, describeThought, renderStatus, type Status, statusPayload, type Thumb } from "./status.ts";
 
 const DIR = join(getAgentDir(), "discord-dms");
 const CONFIG_FILE = join(DIR, "config.json");
@@ -71,8 +73,6 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 /** Built-ins reimplemented for Discord; the rest need the TUI. */
 const DISCORD_BUILTINS = ["help", "stop", "compact", "model", "thinking", "name", "session", "new", "reload"];
 const TUI_BUILTINS = ["settings", "tree", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout", "resume", "quit"];
-const MAX_STATUS_LINES = 20;
-const TOOL_ICONS = { running: "⏳", done: "✅", error: "❌" } as const;
 const YO_COMMAND = "yo";
 const SHARE_COMMAND = "Send to pi";
 const SHARE_PREFIX = "share:";
@@ -118,15 +118,6 @@ const HOLD_QUESTION = {
 		false: "A self-contained answer to the request that reads naturally as a reply in that channel and contains nothing private.",
 	},
 };
-
-interface ToolLine {
-	id: string;
-	text: string;
-	state: keyof typeof TOOL_ICONS;
-	since: number;
-	/** Latest line of output while it runs. */
-	output?: string;
-}
 
 interface IncomingFile {
 	url: string;
@@ -259,37 +250,6 @@ function chunkText(text: string, max = MAX_CHUNK): string[] {
 	return chunks;
 }
 
-/** Text squeezed onto one line, safe inside inline code. */
-function oneLine(text: string): string {
-	const line = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
-	return line.length > 80 ? `${line.slice(0, 77)}…` : line;
-}
-
-function describeTool(name: string, args: unknown): string {
-	const a = (args ?? {}) as Record<string, unknown>;
-	const key = ["command", "path", "file_path", "pattern", "query", "url", "paths"].find((k) => a[k] !== undefined);
-	let detail = key ? a[key] : Object.keys(a).length > 0 ? args : "";
-	if (typeof detail !== "string") detail = JSON.stringify(detail);
-	const summary = oneLine(detail as string);
-	return summary ? `**${name}** \`${summary}\`` : `**${name}**`;
-}
-
-/** The start of the latest paragraph long enough to say something. */
-function describeThought(thinking: string): string {
-	const paragraphs = thinking.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-	const thought = oneLine(paragraphs.findLast((p) => p.length >= 40) ?? paragraphs.at(-1) ?? "");
-	return thought ? `💭 \`${thought}\`` : "💭";
-}
-
-/** The last line a running tool printed, for tools that stream text. */
-function lastOutputLine(partial: unknown): string | undefined {
-	const content = (partial as { content?: { type: string; text?: string }[] } | undefined)?.content;
-	const text = content?.find((c) => c.type === "text")?.text;
-	const lines = text?.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split(/[\r\n]/);
-	const last = lines?.findLast((line) => line.trim());
-	return last ? oneLine(last) : undefined;
-}
-
 /** Context line for a Discord reply, written in the user's voice. */
 function describeReply(quoted: Message, fromPi: boolean): string {
 	let excerpt = quoted.content.replace(/\s+/g, " ").trim();
@@ -414,6 +374,31 @@ const MAX_V2_TEXT = 3800;
 const MAX_V2_COMPONENTS = 40;
 const MAX_V2_FILES = 10;
 const MAX_GALLERY = 10;
+
+/** Pi's own resizer, when this version of pi exports it. */
+const resizeImage = (codingAgent as unknown as { resizeImage?: Resize }).resizeImage;
+type Resize = (
+	bytes: Uint8Array,
+	mimeType: string,
+	options: { maxWidth: number; maxHeight: number; maxBytes: number; jpegQuality: number },
+) => Promise<{ data: string; mimeType: string } | null>;
+const THUMB_EXT: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp" };
+let thumbCount = 0;
+
+/** A small copy of an image pi read, to show beside its line in the status message. */
+async function thumbnail(image: ImageContent, alt: string): Promise<Thumb | undefined> {
+	let data = Buffer.from(image.data, "base64");
+	let mimeType = image.mimeType;
+	const options = { maxWidth: 320, maxHeight: 320, maxBytes: 256 * 1024, jpegQuality: 75 };
+	const small = await resizeImage?.(data, mimeType, options).catch(() => null);
+	if (small) {
+		data = Buffer.from(small.data, "base64");
+		mimeType = small.mimeType;
+	}
+	const ext = THUMB_EXT[mimeType];
+	if (!ext || data.length > MAX_UPLOAD_BYTES) return undefined;
+	return { name: `seen-${++thumbCount}.${ext}`, data, alt };
+}
 
 /** A file embedded in a reply: uploaded from `path`, or shown from `url`. */
 interface Embed {
@@ -601,14 +586,13 @@ export default function (pi: ExtensionAPI) {
 	let runOrigins: Origin[] = [];
 
 	// Tool-call status message: one live message per armed run, reposted below new text.
-	let tools: ToolLine[] = [];
+	const status: Status = { tools: [], done: false };
 	let statusMsg: Message | undefined;
+	let statusImage: string | undefined; // the image statusMsg has attached
 	let statusStale = false; // text was posted after the status message
 	let statusDirty = false;
-	let statusDone = false;
 	let statusTimer: ReturnType<typeof setTimeout> | undefined;
-	// What pi is doing before its next tool call: one extra line that goes away once it acts.
-	let pending: { key: string; text: string; since: number } | undefined;
+	let imagesRejected = false; // Discord refused a status with an image this run
 
 	// All Discord writes go through one queue so they land in transcript order.
 	let queue: Promise<unknown> = Promise.resolve();
@@ -634,40 +618,37 @@ export default function (pi: ExtensionAPI) {
 
 	// --- status message --------------------------------------------------------
 
-	const statusText = () => {
-		const count = `${tools.length} tool call${tools.length === 1 ? "" : "s"}`;
-		const failed = tools.filter((tool) => tool.state === "error").length;
-		const header = `-# ${statusDone ? "✓" : "🔧"} ${count}${failed ? ` · ${failed} failed` : ""}`;
-		// Discord keeps these counting up, so live lines need no edits to show how long they've taken.
-		const ago = (since: number) => ` · <t:${Math.floor(since / 1000)}:R>`;
-		// Newest calls win; older ones collapse into a count so the message stays under Discord's limit.
-		const lines = pending && !statusDone ? [pending.text + ago(pending.since)] : [];
-		let length = header.length + (lines[0]?.length ?? 0);
-		for (let i = tools.length - 1; i >= 0 && lines.length < MAX_STATUS_LINES; i--) {
-			const tool = tools[i];
-			let line = `${TOOL_ICONS[tool.state]} ${tool.text}`;
-			if (tool.state === "running" && !statusDone) {
-				line += ago(tool.since);
-				if (tool.output) line += `\n-# \`${tool.output}\``;
-			}
-			if (length + line.length + 40 > MAX_CHUNK) break;
-			lines.unshift(line);
-			length += line.length + 1;
-		}
-		const hidden = tools.length - lines.length + (pending && !statusDone ? 1 : 0);
-		return [header, ...(hidden > 0 ? [`-# … ${hidden} earlier`] : []), ...lines].join("\n");
-	};
-
 	// Must run inside the queue.
 	const flushStatus = async () => {
-		if (!statusDirty || !dm) return;
+		const channel = dm;
+		if (!statusDirty || !channel) return;
 		statusDirty = false;
-		if (statusMsg && !statusStale) {
-			await statusMsg.edit(statusText());
-			return;
+		const editing = statusStale ? undefined : statusMsg;
+		const write = async (images: boolean) => {
+			const view = renderStatus(status, cwd(), MAX_V2_TEXT, images);
+			const payload = statusPayload(view, editing ? statusImage : undefined);
+			const message = editing
+				? await editing.edit(payload)
+				: await channel.send({
+						...payload,
+						flags: [MessageFlags.IsComponentsV2, MessageFlags.SuppressNotifications],
+						allowedMentions: { parse: [] },
+					});
+			statusImage = view.section?.image.name;
+			return message;
+		};
+		let message: Message;
+		try {
+			message = await write(!imagesRejected);
+		} catch (err) {
+			// An image Discord won't take shouldn't cost the status: go on without images.
+			if (imagesRejected || !status.tools.some((tool) => tool.image)) throw err;
+			imagesRejected = true;
+			message = await write(false);
 		}
+		if (editing) return;
 		const previous = statusMsg;
-		statusMsg = await dm.send({ content: statusText(), flags: MessageFlags.SuppressNotifications });
+		statusMsg = message;
 		statusStale = false;
 		await previous?.delete().catch(() => {});
 	};
@@ -684,25 +665,28 @@ export default function (pi: ExtensionAPI) {
 
 	/** Show what pi is doing in the live status message, without creating or moving it. */
 	const setPending = (key?: string, text = "") => {
+		const { pending } = status;
 		if (!key) {
 			if (!pending) return;
-			pending = undefined;
+			status.pending = undefined;
 		} else if (pending?.key === key) {
 			if (pending.text === text) return;
 			pending.text = text;
 		} else {
-			pending = { key, text, since: Date.now() };
+			status.pending = { key, text, since: Date.now() };
 		}
 		if (statusMsg && !statusStale) bumpStatus();
 	};
 
 	const resetRun = () => {
-		tools = [];
-		pending = undefined;
+		status.tools = [];
+		status.pending = undefined;
+		status.done = false;
 		statusMsg = undefined;
+		statusImage = undefined;
 		statusStale = false;
 		statusDirty = false;
-		statusDone = false;
+		imagesRejected = false;
 	};
 
 	const finishRun = () => {
@@ -714,8 +698,8 @@ export default function (pi: ExtensionAPI) {
 		if (statusTimer) clearTimeout(statusTimer);
 		statusTimer = undefined;
 		enqueue(async () => {
-			if (tools.length > 0) {
-				statusDone = true;
+			if (status.tools.length > 0) {
+				status.done = true;
 				statusDirty = true;
 				statusStale = false; // finalize in place rather than reposting
 				await flushStatus();
@@ -724,7 +708,6 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	/** Post text (and optional files) after any pending status update. */
 	const cwd = () => ctxRef?.cwd ?? process.cwd();
 
 	/** Post text, with any files it embeds, after any pending status update. */
@@ -1386,18 +1369,17 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_execution_start", (event) => {
 		if (!armed) return;
-		pending = undefined;
-		tools.push({ id: event.toolCallId, text: describeTool(event.toolName, event.args), state: "running", since: Date.now() });
+		status.pending = undefined;
+		status.tools.push({ id: event.toolCallId, name: event.toolName, args: event.args ?? {}, state: "running", since: Date.now() });
 		bumpStatus();
 	});
 
 	pi.on("tool_execution_update", (event) => {
-		const tool = tools.find((t) => t.id === event.toolCallId);
+		const tool = status.tools.find((t) => t.id === event.toolCallId);
 		if (!armed || !tool) return;
-		const output = lastOutputLine(event.partialResult);
-		if (output === tool.output) return;
-		tool.output = output;
-		bumpStatus();
+		tool.output = textOf(event.partialResult?.content ?? []);
+		// Only the latest call shows its output.
+		if (tool === status.tools.at(-1)) bumpStatus();
 	});
 
 	pi.on("message_update", (event) => {
@@ -1409,7 +1391,7 @@ export default function (pi: ExtensionAPI) {
 		} else if (update.type === "toolcall_start" || update.type === "toolcall_delta") {
 			const block = update.partial.content[update.contentIndex];
 			if (block?.type === "toolCall" && block.name) {
-				setPending(`toolcall:${update.contentIndex}`, `✍️ ${describeTool(block.name, block.arguments)}`);
+				setPending(`toolcall:${update.contentIndex}`, `✍️ ${describeCall(block.name, block.arguments, cwd())}`);
 			}
 		} else if (update.type === "text_start") {
 			setPending();
@@ -1417,10 +1399,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_end", (event) => {
-		const tool = tools.find((t) => t.id === event.toolCallId);
+		const tool = status.tools.find((t) => t.id === event.toolCallId);
 		if (!armed || !tool) return;
 		tool.state = event.isError ? "error" : "done";
+		tool.ms = event.durationMs;
+		const content: { type: string }[] = event.result?.content ?? [];
+		tool.output = textOf(content);
+		if (typeof event.result?.details?.patch === "string") tool.patch = event.result.details.patch;
 		bumpStatus();
+		const image = content.find((c): c is ImageContent => c.type === "image");
+		if (!image) return;
+		void thumbnail(image, String(tool.args.path ?? tool.args.file_path ?? "image")).then((thumb) => {
+			if (!thumb || !status.tools.includes(tool)) return;
+			// Only the latest image shows, so only it needs keeping.
+			for (const other of status.tools) other.image = undefined;
+			tool.image = thumb;
+			bumpStatus();
+		});
 	});
 
 	// Typing shows for every run while connected; it never notifies.
