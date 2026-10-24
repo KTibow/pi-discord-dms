@@ -123,6 +123,9 @@ interface ToolLine {
 	id: string;
 	text: string;
 	state: keyof typeof TOOL_ICONS;
+	since: number;
+	/** Latest line of output while it runs. */
+	output?: string;
 }
 
 interface IncomingFile {
@@ -256,14 +259,35 @@ function chunkText(text: string, max = MAX_CHUNK): string[] {
 	return chunks;
 }
 
+/** Text squeezed onto one line, safe inside inline code. */
+function oneLine(text: string): string {
+	const line = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
+	return line.length > 80 ? `${line.slice(0, 77)}…` : line;
+}
+
 function describeTool(name: string, args: unknown): string {
 	const a = (args ?? {}) as Record<string, unknown>;
 	const key = ["command", "path", "file_path", "pattern", "query", "url", "paths"].find((k) => a[k] !== undefined);
 	let detail = key ? a[key] : Object.keys(a).length > 0 ? args : "";
 	if (typeof detail !== "string") detail = JSON.stringify(detail);
-	let summary = (detail as string).replace(/\s+/g, " ").replace(/`/g, "'").trim();
-	if (summary.length > 80) summary = `${summary.slice(0, 77)}…`;
+	const summary = oneLine(detail as string);
 	return summary ? `**${name}** \`${summary}\`` : `**${name}**`;
+}
+
+/** The start of the latest paragraph long enough to say something. */
+function describeThought(thinking: string): string {
+	const paragraphs = thinking.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+	const thought = oneLine(paragraphs.findLast((p) => p.length >= 40) ?? paragraphs.at(-1) ?? "");
+	return thought ? `💭 \`${thought}\`` : "💭";
+}
+
+/** The last line a running tool printed, for tools that stream text. */
+function lastOutputLine(partial: unknown): string | undefined {
+	const content = (partial as { content?: { type: string; text?: string }[] } | undefined)?.content;
+	const text = content?.find((c) => c.type === "text")?.text;
+	const lines = text?.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split(/[\r\n]/);
+	const last = lines?.findLast((line) => line.trim());
+	return last ? oneLine(last) : undefined;
 }
 
 /** Context line for a Discord reply, written in the user's voice. */
@@ -583,6 +607,8 @@ export default function (pi: ExtensionAPI) {
 	let statusDirty = false;
 	let statusDone = false;
 	let statusTimer: ReturnType<typeof setTimeout> | undefined;
+	// What pi is doing before its next tool call: one extra line that goes away once it acts.
+	let pending: { key: string; text: string; since: number } | undefined;
 
 	// All Discord writes go through one queue so they land in transcript order.
 	let queue: Promise<unknown> = Promise.resolve();
@@ -612,16 +638,23 @@ export default function (pi: ExtensionAPI) {
 		const count = `${tools.length} tool call${tools.length === 1 ? "" : "s"}`;
 		const failed = tools.filter((tool) => tool.state === "error").length;
 		const header = `-# ${statusDone ? "✓" : "🔧"} ${count}${failed ? ` · ${failed} failed` : ""}`;
+		// Discord keeps these counting up, so live lines need no edits to show how long they've taken.
+		const ago = (since: number) => ` · <t:${Math.floor(since / 1000)}:R>`;
 		// Newest calls win; older ones collapse into a count so the message stays under Discord's limit.
-		const lines: string[] = [];
-		let length = header.length;
+		const lines = pending && !statusDone ? [pending.text + ago(pending.since)] : [];
+		let length = header.length + (lines[0]?.length ?? 0);
 		for (let i = tools.length - 1; i >= 0 && lines.length < MAX_STATUS_LINES; i--) {
-			const line = `${TOOL_ICONS[tools[i].state]} ${tools[i].text}`;
+			const tool = tools[i];
+			let line = `${TOOL_ICONS[tool.state]} ${tool.text}`;
+			if (tool.state === "running" && !statusDone) {
+				line += ago(tool.since);
+				if (tool.output) line += `\n-# \`${tool.output}\``;
+			}
 			if (length + line.length + 40 > MAX_CHUNK) break;
 			lines.unshift(line);
 			length += line.length + 1;
 		}
-		const hidden = tools.length - lines.length;
+		const hidden = tools.length - lines.length + (pending && !statusDone ? 1 : 0);
 		return [header, ...(hidden > 0 ? [`-# … ${hidden} earlier`] : []), ...lines].join("\n");
 	};
 
@@ -634,7 +667,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const previous = statusMsg;
-		statusMsg = await dm.send(statusText());
+		statusMsg = await dm.send({ content: statusText(), flags: MessageFlags.SuppressNotifications });
 		statusStale = false;
 		await previous?.delete().catch(() => {});
 	};
@@ -649,8 +682,23 @@ export default function (pi: ExtensionAPI) {
 		}, delay);
 	};
 
+	/** Show what pi is doing in the live status message, without creating or moving it. */
+	const setPending = (key?: string, text = "") => {
+		if (!key) {
+			if (!pending) return;
+			pending = undefined;
+		} else if (pending?.key === key) {
+			if (pending.text === text) return;
+			pending.text = text;
+		} else {
+			pending = { key, text, since: Date.now() };
+		}
+		if (statusMsg && !statusStale) bumpStatus();
+	};
+
 	const resetRun = () => {
 		tools = [];
+		pending = undefined;
 		statusMsg = undefined;
 		statusStale = false;
 		statusDirty = false;
@@ -1323,6 +1371,7 @@ export default function (pi: ExtensionAPI) {
 			if (runActive && !localRun && dm && !isSilent(text)) void post(text);
 			return;
 		}
+		setPending();
 		if (!isSilent(text)) {
 			void post(text);
 			for (const origin of runOrigins) origin.answer = text;
@@ -1337,8 +1386,34 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_execution_start", (event) => {
 		if (!armed) return;
-		tools.push({ id: event.toolCallId, text: describeTool(event.toolName, event.args), state: "running" });
+		pending = undefined;
+		tools.push({ id: event.toolCallId, text: describeTool(event.toolName, event.args), state: "running", since: Date.now() });
 		bumpStatus();
+	});
+
+	pi.on("tool_execution_update", (event) => {
+		const tool = tools.find((t) => t.id === event.toolCallId);
+		if (!armed || !tool) return;
+		const output = lastOutputLine(event.partialResult);
+		if (output === tool.output) return;
+		tool.output = output;
+		bumpStatus();
+	});
+
+	pi.on("message_update", (event) => {
+		if (!armed) return;
+		const update = event.assistantMessageEvent;
+		if (update.type === "thinking_start" || update.type === "thinking_delta") {
+			const block = update.partial.content[update.contentIndex];
+			setPending(`thinking:${update.contentIndex}`, describeThought(block?.type === "thinking" ? block.thinking : ""));
+		} else if (update.type === "toolcall_start" || update.type === "toolcall_delta") {
+			const block = update.partial.content[update.contentIndex];
+			if (block?.type === "toolCall" && block.name) {
+				setPending(`toolcall:${update.contentIndex}`, `✍️ ${describeTool(block.name, block.arguments)}`);
+			}
+		} else if (update.type === "text_start") {
+			setPending();
+		}
 	});
 
 	pi.on("tool_execution_end", (event) => {

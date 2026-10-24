@@ -109,9 +109,10 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
 
 - While armed, each assistant message's text is posted to the DM. That includes the short
   comments pi writes between tool calls, just as the TUI shows them.
-- Each tool call updates one status line, for example `🔧 4 tool calls · latest: bash 'npm test'`.
-  After pi posts text, the next tool call moves the status line below it. It shows `✓` when the
-  run ends.
+- Tool calls are listed in one status message, which arrives silently. Running tools show how
+  long they've been going and their latest line of output. Between tool calls, one more line shows
+  what pi is thinking or which tool call it's writing, and it goes away once pi acts. After pi
+  posts text, the next tool call moves the status message below it. It shows `✓` when the run ends.
 - A reply that is empty or exactly `[silent]` is not posted. Errors and aborts are posted.
 - The bridge **disarms** when the agent settles, meaning no retries, compactions or queued
   messages remain. It also disarms when a user message that didn't come from Discord enters the
