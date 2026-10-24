@@ -103,10 +103,10 @@ export function describeCall(name: string, args: Record<string, unknown>, cwd: s
 	if (name === "read" && path) {
 		const offset = typeof args.offset === "number" ? args.offset : undefined;
 		const limit = typeof args.limit === "number" ? args.limit : undefined;
-		const range = offset || limit ? ` lines ${offset ?? 1}–${limit ? (offset ?? 1) + limit - 1 : ""}` : "";
+		const range = offset || limit ? ` · lines ${offset ?? 1}–${limit ? (offset ?? 1) + limit - 1 : ""}` : "";
 		return `**read** ${path}${range}`;
 	}
-	if (name === "edit" && path) return `**edit** ${path}${patch ? ` ${patchStats(patch)}` : ""}`;
+	if (name === "edit" && path) return `**edit** ${path}${patch ? ` · ${patchStats(patch)}` : ""}`;
 	if (name === "write" && path && typeof args.content === "string") {
 		return `**write** ${path} · ${args.content.split("\n").length} lines`;
 	}
