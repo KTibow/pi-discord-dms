@@ -52,6 +52,11 @@ export interface StatusView {
 	after: string;
 }
 
+/** "1 line", "2 lines". */
+function plural(count: number, noun: string): string {
+	return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
 /** Text squeezed onto one line, safe inside inline code. */
 export function oneLine(text: string, max = 80): string {
 	const line = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
@@ -103,12 +108,14 @@ export function describeCall(name: string, args: Record<string, unknown>, cwd: s
 	if (name === "read" && path) {
 		const offset = typeof args.offset === "number" ? args.offset : undefined;
 		const limit = typeof args.limit === "number" ? args.limit : undefined;
-		const range = offset || limit ? ` · lines ${offset ?? 1}–${limit ? (offset ?? 1) + limit - 1 : ""}` : "";
+		const first = offset ?? 1;
+		const last = limit ? first + limit - 1 : undefined;
+		const range = !offset && !limit ? "" : last === first ? ` · line ${first}` : ` · lines ${first}–${last ?? ""}`;
 		return `**read** ${path}${range}`;
 	}
 	if (name === "edit" && path) return `**edit** ${path}${patch ? ` · ${patchStats(patch)}` : ""}`;
 	if (name === "write" && path && typeof args.content === "string") {
-		return `**write** ${path} · ${args.content.split("\n").length} lines`;
+		return `**write** ${path} · ${plural(args.content.split("\n").length, "line")}`;
 	}
 	const key = ["command", "path", "file_path", "pattern", "query", "url", "paths"].find((k) => args[k] !== undefined);
 	let detail = key ? args[key] : Object.keys(args).length > 0 ? args : "";
@@ -150,7 +157,7 @@ function fence(lang: string, lines: string[]): string {
 	return `\`\`\`${lang}\n${body.join("\n")}\n\`\`\``;
 }
 
-const more = (count: number, what: string) => (count > 0 ? `\n-# … ${count} more ${what}` : "");
+const more = (count: number) => (count > 0 ? `\n-# … ${plural(count, "more line")}` : "");
 
 /** Changed lines of a patch with one line of context around them. */
 function previewPatch(patch: string): string {
@@ -167,7 +174,7 @@ function previewPatch(patch: string): string {
 	while (kept[0] === " ⋯") kept.shift();
 	while (kept.at(-1) === " ⋯") kept.pop();
 	const shown = kept.slice(0, PREVIEW_LINES + 4);
-	return fence("diff", shown) + more(kept.length - shown.length, "lines");
+	return fence("diff", shown) + more(kept.length - shown.length);
 }
 
 /** What the latest call produced, shown under its line. */
@@ -176,7 +183,7 @@ function preview(tool: ToolLine): string | undefined {
 	if (tool.name === "write" && typeof tool.args.content === "string") {
 		const path = String(tool.args.path ?? tool.args.file_path ?? "");
 		const lines = tool.args.content.split("\n");
-		return fence(extname(path).slice(1), lines.slice(0, PREVIEW_LINES)) + more(lines.length - PREVIEW_LINES, "lines");
+		return fence(extname(path).slice(1), lines.slice(0, PREVIEW_LINES)) + more(lines.length - PREVIEW_LINES);
 	}
 	if (!tool.output || tool.image || ["read", "edit", "write"].includes(tool.name)) return undefined;
 	const { lines } = outputLines(tool.output);
@@ -190,15 +197,14 @@ function preview(tool: ToolLine): string | undefined {
 					shown.map((line) => `\x1b[31m${line}\x1b[0m`),
 				)
 			: fence("", shown);
-	return (hidden > 0 ? `-# … ${hidden} earlier lines\n` : "") + block;
+	return (hidden > 0 ? `-# … ${plural(hidden, "earlier line")}\n` : "") + block;
 }
 
 /** The status message as text, newest calls winning when it would run past `maxChars`. */
 export function renderStatus(status: Status, cwd: string, maxChars: number, images = true): StatusView {
 	const { tools, pending, done } = status;
 	const failed = tools.filter((tool) => tool.state === "error").length;
-	const count = `${tools.length} tool call${tools.length === 1 ? "" : "s"}`;
-	const header = `-# ${done ? "✓" : "🔧"} ${count}${failed ? ` · ${failed} failed` : ""}`;
+	const header = `-# ${done ? "✓" : "🔧"} ${plural(tools.length, "tool call")}${failed ? ` · ${failed} failed` : ""}`;
 	// Discord keeps these counting up, so live lines need no edits to show how long they've taken.
 	const ago = (since: number) => ` · <t:${Math.floor(since / 1000)}:R>`;
 
