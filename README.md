@@ -112,7 +112,8 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
 - Tool calls are listed in one status message, which arrives silently. Commands read like a
   shell prompt, so `cd dir && make` shows as `dir $ make`, or `$ make` when `dir` is pi's own. Failed calls show their exit code and
   last line of output, and running ones show how long they've been going. The latest call also
-  shows its last lines of output, its diff or the start of the file it wrote. The latest image pi
+  shows its last lines of output, its diff, the start of the file it wrote or, until it prints
+  anything, the script it was fed with `<<EOF`. The latest image pi
   read appears beside its line. One more line shows what pi is thinking or which tool call it's
   writing, and it goes away once pi acts. After pi posts text, the next tool call moves the status
   message below it, as does thinking that goes on for 10 seconds. Thinking that long before the

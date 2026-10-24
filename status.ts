@@ -85,21 +85,56 @@ function tidyPath(path: string, cwd: string): string {
 	return absolute === HOME || absolute.startsWith(`${HOME}/`) ? `~${absolute.slice(HOME.length)}` : absolute;
 }
 
+/** The directory a command starts with `cd dir &&` into, and the rest without wrappers like `timeout 30`. */
+function unwrap(command: string): { dir?: string; rest: string } {
+	const cd = command.match(/^\s*cd\s+("[^"]*"|'[^']*'|\S+)\s*(?:&&|;|\n)\s*/);
+	const dir = cd?.[1].replace(/^["']|["']$/g, "").replace(/\/+$/, "");
+	const rest = (cd ? command.slice(cd[0].length) : command).trim().replace(/^timeout\s+\S+\s+/, "");
+	return { dir, rest };
+}
+
+const SCRIPT_LANGS: Record<string, string> = { python: "py", node: "js", deno: "ts", bun: "ts", bash: "sh", sh: "sh", zsh: "sh", ruby: "rb", perl: "pl" };
+/** Script lines that say little about what it does. */
+const BOILERPLATE = /^(#|\/\/|import\s|from\s+\S+\s+import\s|(const|let|var)\s+.+=\s*require\(|["']use strict["'])/;
+
+/** Lines of a command or script on one line, separated as the shell would read them. */
+function joinLines(lines: string[]): string {
+	let joined = "";
+	for (const line of lines.map((l) => l.trim()).filter(Boolean)) {
+		const continues = !joined || /(\\|\|\||&&|[|({]|\b(do|then|else|in))$/.test(joined);
+		joined = continues ? `${joined.replace(/\\$/, "")} ${line}`.trim() : `${joined.replace(/;$/, "")}; ${line}`;
+	}
+	return joined.replace(/;$/, "");
+}
+
+/** A command that feeds in a script with `<<EOF`: the command, the script and its language. */
+function heredoc(command: string): { head: string; body: string[]; lang: string } | undefined {
+	const [first, ...rest] = command.split("\n");
+	const marker = first.match(/\s*<<-?\s*(['"]?)(\w+)\1/);
+	if (!marker) return undefined;
+	const end = rest.findIndex((line) => line.trim() === marker[2]);
+	const head = first.replace(marker[0], "").replace(/\s+-(?=\s|$)/, "").trim();
+	const target = head.match(/>\s*(\S+)$/)?.[1];
+	const program = basename(head.split(/\s+/)[0]).replace(/[\d.]+$/, "");
+	const lang = target ? extname(target).slice(1) : (SCRIPT_LANGS[program] ?? "");
+	return { head, body: end === -1 ? rest : rest.slice(0, end), lang };
+}
+
 /**
  * A command as a prompt line. A leading `cd dir &&` becomes the prompt, unless it's into pi's
- * own directory, and only the first line of a multi-line command shows.
+ * own directory. A script fed in with `<<EOF` shows its telling lines.
  */
 function describeCommand(command: string, cwd: string): string {
-	const cd = command.match(/^\s*cd\s+("[^"]*"|'[^']*'|\S+)\s*(?:&&|;|\n)\s*/);
-	let prompt = "$";
-	if (cd) {
-		const dir = cd[1].replace(/^["']|["']$/g, "").replace(/\/+$/, "");
-		if (resolve(cwd, dir.replace(/^~(?=\/|$)/, HOME)) !== resolve(cwd)) prompt = `${basename(dir) || dir} $`;
-		command = command.slice(cd[0].length);
+	const { dir, rest } = unwrap(command);
+	const away = dir !== undefined && resolve(cwd, dir.replace(/^~(?=\/|$)/, HOME)) !== resolve(cwd);
+	const prompt = away ? `${basename(dir) || dir} $` : "$";
+	const script = heredoc(rest);
+	let text = joinLines(rest.split("\n"));
+	if (script) {
+		const telling = script.body.filter((line) => !BOILERPLATE.test(line.trim()));
+		text = `${script.head} << ${joinLines(telling.some((line) => line.trim()) ? telling : script.body)}`;
 	}
-	const [first, ...rest] = command.trim().split("\n");
-	const more = rest.some((line) => line.trim()) ? " …" : "";
-	return `\`${oneLine(`${prompt} ${first.replaceAll(HOME, "~")}${more}`)}\``;
+	return `\`${oneLine(`${prompt} ${text.replaceAll(HOME, "~")}`)}\``;
 }
 
 function patchStats(patch: string): string {
@@ -193,6 +228,13 @@ function preview(tool: ToolLine): string | undefined {
 		const path = String(tool.args.path ?? tool.args.file_path ?? "");
 		const lines = tool.args.content.split("\n");
 		return fence(extname(path).slice(1), lines.slice(0, PREVIEW_LINES)) + more(lines.length - PREVIEW_LINES);
+	}
+	if (tool.name === "bash" && !tool.output?.trim() && typeof tool.args.command === "string") {
+		// Until it prints anything, a script it was fed is what there is to see.
+		const script = heredoc(unwrap(tool.args.command).rest);
+		if (script && script.body.length > 0) {
+			return fence(script.lang, script.body.slice(0, PREVIEW_LINES)) + more(script.body.length - PREVIEW_LINES);
+		}
 	}
 	if (!tool.output || tool.image || ["read", "edit", "write"].includes(tool.name)) return undefined;
 	const { lines } = outputLines(tool.output);
