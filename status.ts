@@ -67,13 +67,13 @@ export function oneLine(text: string, max = WIDTH): string {
 	return line.length > max ? `${line.slice(0, max - 3)}…` : line;
 }
 
-/** The start of the latest paragraph long enough to say something. */
+/** The latest sentence or line long enough to say something, so a short or unfinished one doesn't flicker. */
 export function describeThought(thinking: string): string {
-	const paragraphs = thinking
-		.split(/\n\s*\n/)
-		.map((p) => p.trim())
+	const sentences = thinking
+		.split(/\n+|(?<=[.!?])\s+(?=[A-Z0-9"'(`])/)
+		.map((s) => s.trim())
 		.filter(Boolean);
-	const thought = oneLine(paragraphs.findLast((p) => p.length >= 40) ?? paragraphs.at(-1) ?? "");
+	const thought = oneLine(sentences.findLast((s) => s.length >= 40) ?? sentences.at(-1) ?? "");
 	return thought ? `💭 \`${thought}\`` : "💭";
 }
 
