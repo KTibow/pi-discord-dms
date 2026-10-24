@@ -113,9 +113,10 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
   shell prompt, so `cd dir && make` shows as `dir $ make`, or `$ make` when `dir` is pi's own. Failed calls show their exit code and
   last line of output, and running ones show how long they've been going. The latest call also
   shows its last lines of output, its diff or the start of the file it wrote. The latest image pi
-  read appears beside its line. Between tool calls, one more line shows what pi is thinking or
-  which tool call it's writing, and it goes away once pi acts. After pi posts text, the next tool
-  call moves the status message below it. When the run ends, it shows `✓` and the total time, and
+  read appears beside its line. One more line shows what pi is thinking or which tool call it's
+  writing, and it goes away once pi acts. After pi posts text, the next tool call moves the status
+  message below it, as does thinking that goes on for 10 seconds. Thinking that long before the
+  first tool call gets a status message of its own, which goes away if pi answers without tools. When the run ends, it shows `✓` and the total time, and
   keeps one line per call: the output, diff, image and thinking lines go away.
 - A reply that is empty or exactly `[silent]` is not posted. Errors and aborts are posted.
 - The bridge **disarms** when the agent settles, meaning no retries, compactions or queued

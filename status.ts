@@ -240,7 +240,8 @@ export function renderStatus(status: Status, cwd: string, maxChars: number, imag
 	while (first > 0 && lines.length - first < MAX_LINES && (first === lines.length || budget >= lines[first - 1].length + 1)) {
 		budget -= lines[--first].length + 1;
 	}
-	const head = [header, ...(first > 0 ? [`-# … ${first} earlier`] : [])];
+	// Before the first call there's only the thinking line.
+	const head = tools.length === 0 ? [] : [header, ...(first > 0 ? [`-# … ${first} earlier`] : [])];
 	const join = (parts: (string | undefined)[]) => parts.filter(Boolean).join("\n");
 
 	const imageAt = images && !done ? tools.findLastIndex((tool) => tool.image) : -1;

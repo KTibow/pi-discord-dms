@@ -69,6 +69,8 @@ const ENTRY_TYPE = "discord-dms";
 const MAX_CHUNK = 1900;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const STATUS_THROTTLE_MS = 1500;
+/** Thinking this long gets a status message even when it means sending or moving one. */
+const PENDING_SHOW_MS = 10_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 /** Built-ins reimplemented for Discord; the rest need the TUI. */
 const DISCORD_BUILTINS = ["help", "stop", "compact", "model", "thinking", "name", "session", "new", "reload"];
@@ -623,6 +625,13 @@ export default function (pi: ExtensionAPI) {
 		const channel = dm;
 		if (!statusDirty || !channel) return;
 		statusDirty = false;
+		if (status.tools.length === 0 && !status.pending) {
+			// It only showed pi thinking, and that's over.
+			await statusMsg?.delete().catch(() => {});
+			statusMsg = undefined;
+			statusStale = false;
+			return;
+		}
 		const editing = statusStale ? undefined : statusMsg;
 		const write = async (images: boolean) => {
 			const view = renderStatus(status, cwd(), MAX_V2_TEXT, images);
@@ -663,7 +672,10 @@ export default function (pi: ExtensionAPI) {
 		}, delay);
 	};
 
-	/** Show what pi is doing in the live status message, without creating or moving it. */
+	/**
+	 * Show what pi is doing in the live status message. Only once it has gone on a while does
+	 * it send a status message, or move one below text pi posted.
+	 */
 	const setPending = (key?: string, text = "") => {
 		const { pending } = status;
 		if (!key) {
@@ -673,7 +685,11 @@ export default function (pi: ExtensionAPI) {
 			if (pending.text === text) return;
 			pending.text = text;
 		} else {
-			status.pending = { key, text, since: Date.now() };
+			const next = { key, text, since: Date.now() };
+			status.pending = next;
+			setTimeout(() => {
+				if (armed && status.pending === next && (!statusMsg || statusStale)) bumpStatus();
+			}, PENDING_SHOW_MS);
 		}
 		if (statusMsg && !statusStale) bumpStatus();
 	};
@@ -704,6 +720,8 @@ export default function (pi: ExtensionAPI) {
 				statusDirty = true;
 				statusStale = false; // finalize in place rather than reposting
 				await flushStatus();
+			} else {
+				await statusMsg?.delete().catch(() => {});
 			}
 			resetRun();
 		});
