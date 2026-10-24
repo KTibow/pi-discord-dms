@@ -61,7 +61,7 @@ other way, such as through another bot, it's told to check before saying it can'
 AGENTS.md which access goes with which server ID, and how to use it.
 
 When pi finishes, "Sent to pi" turns into a preview of its final answer with a **Post** button.
-Post sends the answer to the channel, with any files pi sent during that run. After **Send to
+Post sends the answer to the channel, with any files it embeds. After **Send to
 pi** it shows as a reply to the message you shared. After `/yo` it replies to the "Sent to pi"
 message, which others see as "Original message was deleted". Nobody gets pinged.
 
@@ -69,7 +69,8 @@ Tick **Post the answer here automatically** in the form to skip the preview. Bef
 Jev classifier checks that the answer doesn't look private, using the first of the classifiers
 [pi-safety](https://github.com/KTibow/pi-safety) tries that has credentials. If it rates the
 answer 30% or more likely to be private, or no classifier is available, you get the preview
-instead. Runs that end in an error or `!stop` always get the preview.
+instead. Answers that embed local files, and runs that end in an error or `!stop`, always get the
+preview, since the classifier only reads text.
 
 Discord only lets the bot update "Sent to pi" for 15 minutes after you send something. If pi
 takes longer, there's no preview: the DM says it was too late, and you can forward pi's reply
@@ -126,8 +127,18 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
   notification.
 - Messages from other extensions never switch Discord posting on or off.
 
-Pi sends files with the `discord_send_files` tool (`paths`, optional `caption`, 10 MB per file).
-The tool is active only while the session is connected. Ordinary replies don't need a tool.
+### Files in replies
+
+Pi sends a file by embedding it in a reply with Markdown image syntax and a local path or `https`
+URL: `![chart](./chart.png)`. The file shows where pi wrote it, in the same message as the text.
+Images and videos appear inline, and other files, such as PDFs, appear as a download card. Each
+can be up to 10 MB. Plain links, paths and anything in code stay text, so a file is only sent when
+pi embeds it. Embeds that point at a missing file, or at a URL that isn't an image or video, are
+left as written.
+
+These replies use Discord's newer message layout (components v2). If Discord rejects one, the
+files are attached below the text instead. Pi's Discord instructions, including this one, are
+added to its system prompt only while the session is connected.
 
 ## Development
 

@@ -12,6 +12,9 @@
  * channel. Pi answers in the DM, and its final answer can be posted back to that channel
  * as an interaction follow-up: from a preview with a Post button, or automatically once a
  * classifier finds nothing private in it.
+ *
+ * Pi sends files by embedding them in a reply as ![alt](path). Such replies go out as
+ * components v2 messages, with each file shown where it was written.
  */
 
 import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
@@ -33,11 +36,14 @@ import {
 	Client,
 	type DMChannel,
 	Events,
+	FileBuilder,
 	FileUploadBuilder,
 	GatewayIntentBits,
 	type Interaction,
 	InteractionContextType,
 	LabelBuilder,
+	MediaGalleryBuilder,
+	MediaGalleryItemBuilder,
 	Message,
 	MessageFlags,
 	MessageReferenceType,
@@ -45,10 +51,10 @@ import {
 	type ModalSubmitInteraction,
 	Partials,
 	PermissionFlagsBits,
+	TextDisplayBuilder,
 	TextInputBuilder,
 	TextInputStyle,
 } from "discord.js";
-import { Type } from "typebox";
 
 const DIR = join(getAgentDir(), "discord-dms");
 const CONFIG_FILE = join(DIR, "config.json");
@@ -58,7 +64,6 @@ const INBOX_DIR = join(DIR, "inbox");
 const PREFIX = "[discord]";
 const INTERNAL_PREFIX = "__from-discord:";
 const ENTRY_TYPE = "discord-dms";
-const TOOL_NAME = "discord_send_files";
 const MAX_CHUNK = 1900;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const STATUS_THROTTLE_MS = 1500;
@@ -94,6 +99,16 @@ const CLASSIFIERS = [
 	"cloudflare-workers-ai/typesafe/jev",
 	"opencode/jev-1.13",
 ];
+/** Pi's instructions while connected, as a system prompt section. */
+const DISCORD_GUIDE = [
+	`User messages beginning with ${PREFIX} were sent from the user's Discord DM. Your assistant text while answering them is forwarded to that DM automatically, so reply naturally, like texting. Don't use a tool to send text.`,
+	`If a reply to a ${PREFIX} message needs no Discord message, make that text exactly [silent].`,
+	"To send a file, embed it in your reply with Markdown image syntax and a local path or https URL, such as ![chart](./chart.png). Images and videos show where you put them; other files, such as PDFs, show as a download card. Files can be up to 10 MB. Only ![...](...) sends a file: plain links and paths stay text.",
+	"Discord renders Markdown but not tables.",
+	`${PREFIX} messages "sent with /yo" or "sharing" a message came from another Discord channel, named by server and channel ID. The user may want something answered in that channel, or may just be showing you something. Your replies go to the DM, and the user can post your final one in that channel as a reply, with the files it embeds. Write it for whoever it's really for: if it's meant for the channel, just answer, with no private details, and don't explain who or what you are or describe the user's setup unless asked; if it's for the user, just talk to them. This extension can't read that channel, but you might: before saying you can't, check AGENTS.md and your notes for access to that server, such as another bot.`,
+]
+	.map((line) => `- ${line}`)
+	.join("\n");
 const HOLD_QUESTION = {
 	type: "bool" as const,
 	instructions:
@@ -128,7 +143,6 @@ interface Origin {
 	link: string;
 	request: string;
 	answer?: string;
-	files: string[];
 	posted: boolean;
 }
 
@@ -325,10 +339,10 @@ function canPostPublicly(interaction: Interaction): boolean {
 }
 
 /** Preview of an answer, sized to fit one message next to its note. */
-function previewText(answer: string, files: string[], note: string): string {
-	const body = answer.length > PREVIEW_CHARS ? `${answer.slice(0, PREVIEW_CHARS)}…` : answer;
-	const attached = files.length > 0 ? `\n-# + ${files.map((f) => basename(f)).join(", ")}` : "";
-	return `-# ${note}\n${body}${attached}`;
+function previewText(answer: string, note: string): string {
+	const shown = withoutEmbeds(answer);
+	const body = shown.length > PREVIEW_CHARS ? `${shown.slice(0, PREVIEW_CHARS)}…` : shown;
+	return `-# ${note}\n${body}`;
 }
 
 /** Register /yo and "Send to pi". Returns whether they work outside servers the bot is in. */
@@ -361,6 +375,175 @@ async function registerCommands(client: Client): Promise<boolean> {
 function expandPath(path: string, cwd: string): string {
 	if (path === "~" || path.startsWith("~/")) return join(homedir(), path.slice(1));
 	return resolve(cwd, path);
+}
+
+// ---------------------------------------------------------------------------
+// Replies with embedded files
+// ---------------------------------------------------------------------------
+
+/** `![alt](target)`; the target may be wrapped in <> to allow spaces, and may have a "title". */
+const EMBED = /!\[([^\]\n]*)\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+"[^"\n]*")?\s*\)/g;
+/** Files Discord shows inline; others get a download card. */
+const INLINE_EXT = /\.(png|jpe?g|gif|webp|avif|mp4|webm|mov)$/i;
+// Components v2 messages hold 4000 characters of text, 40 components and 10 uploads.
+const MAX_V2_TEXT = 3800;
+const MAX_V2_COMPONENTS = 40;
+const MAX_V2_FILES = 10;
+const MAX_GALLERY = 10;
+
+/** A file embedded in a reply: uploaded from `path`, or shown from `url`. */
+interface Embed {
+	alt: string;
+	path?: string;
+	url?: string;
+	inline: boolean;
+}
+
+interface V2Message {
+	components: (TextDisplayBuilder | MediaGalleryBuilder | FileBuilder)[];
+	files: AttachmentBuilder[];
+}
+
+type Send = (options: {
+	content?: string;
+	components?: V2Message["components"];
+	files?: AttachmentBuilder[];
+	flags?: MessageFlags.IsComponentsV2;
+	allowedMentions: { parse: [] };
+}) => Promise<Message>;
+
+const embedTarget = (target: string) => target.replace(/^<|>$/g, "");
+
+/** Reply text with each embed replaced by its name, for previews and the classifier. */
+function withoutEmbeds(text: string): string {
+	return text.replace(EMBED, (_, alt: string, target: string) => `📎 ${alt || basename(embedTarget(target))}`);
+}
+
+/** Ranges of code fences and code spans, where `![...](...)` stays text. */
+function codeRanges(text: string): [number, number][] {
+	const ranges: [number, number][] = [];
+	for (const match of text.matchAll(/^[ \t]*```[^\n]*\n[\s\S]*?(?:^[ \t]*```[^\n]*$|(?![\s\S]))/gm)) {
+		ranges.push([match.index, match.index + match[0].length]);
+	}
+	for (const match of text.matchAll(/`[^`\n]+`/g)) ranges.push([match.index, match.index + match[0].length]);
+	return ranges;
+}
+
+/** What an embed target points at, or undefined to leave it as text. */
+function resolveEmbed(alt: string, target: string, cwd: string): Embed | undefined {
+	if (/^https?:\/\//i.test(target)) {
+		// Discord shows media from a URL, but can't offer other files from one.
+		try {
+			return INLINE_EXT.test(new URL(target).pathname) ? { alt, url: target, inline: true } : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	const path = expandPath(target.replace(/^file:\/\//, ""), cwd);
+	try {
+		const stat = statSync(path);
+		if (!stat.isFile() || stat.size > MAX_UPLOAD_BYTES) return undefined;
+	} catch {
+		return undefined;
+	}
+	return { alt, path, inline: INLINE_EXT.test(path) };
+}
+
+/** Split a reply into text and embedded files, or undefined when it embeds nothing. */
+function splitEmbeds(text: string, cwd: string): (string | Embed)[] | undefined {
+	const code = codeRanges(text);
+	const pieces: (string | Embed)[] = [];
+	let last = 0;
+	for (const match of text.matchAll(EMBED)) {
+		if (code.some(([start, end]) => match.index >= start && match.index < end)) continue;
+		const embed = resolveEmbed(match[1], embedTarget(match[2]), cwd);
+		if (!embed) continue;
+		pieces.push(text.slice(last, match.index), embed);
+		last = match.index + match[0].length;
+	}
+	if (pieces.length === 0) return undefined;
+	pieces.push(text.slice(last));
+	return pieces;
+}
+
+/** Lay out text and embeds as components v2 messages, keeping each file where it was written. */
+function embedMessages(pieces: (string | Embed)[]): V2Message[] {
+	const messages: V2Message[] = [];
+	let current: V2Message = { components: [], files: [] };
+	let textLength = 0;
+	const fits = (text: number, upload: boolean) =>
+		current.components.length < MAX_V2_COMPONENTS &&
+		textLength + text <= MAX_V2_TEXT &&
+		(!upload || current.files.length < MAX_V2_FILES);
+	const next = () => {
+		if (current.components.length > 0) messages.push(current);
+		current = { components: [], files: [] };
+		textLength = 0;
+	};
+
+	for (const piece of pieces) {
+		if (typeof piece === "string") {
+			for (const chunk of chunkText(piece.trim())) {
+				if (!fits(chunk.length, false)) next();
+				current.components.push(new TextDisplayBuilder().setContent(chunk));
+				textLength += chunk.length;
+			}
+			continue;
+		}
+		if (!fits(0, piece.path !== undefined)) next();
+		let url = piece.url ?? "";
+		if (piece.path !== undefined) {
+			// File cards show this name, so keep it unless two uploads in one message share it.
+			const base = basename(piece.path).replace(/[^\w.-]/g, "_");
+			const taken = new Set(current.files.map((file) => file.name));
+			let name = base;
+			for (let n = 2; taken.has(name); n++) name = base.replace(/(\.[^.]*)?$/, `-${n}$1`);
+			current.files.push(new AttachmentBuilder(piece.path, { name }));
+			url = `attachment://${name}`;
+		}
+		if (!piece.inline) {
+			current.components.push(new FileBuilder().setURL(url));
+			continue;
+		}
+		const item = new MediaGalleryItemBuilder().setURL(url);
+		if (piece.alt) item.setDescription(piece.alt.slice(0, 1024));
+		// Media written next to each other share a gallery.
+		const previous = current.components.at(-1);
+		if (previous instanceof MediaGalleryBuilder && previous.items.length < MAX_GALLERY) previous.addItems(item);
+		else current.components.push(new MediaGalleryBuilder().addItems(item));
+	}
+	next();
+	return messages;
+}
+
+/**
+ * Send reply text as up to `max` Discord messages. Files embedded with ![alt](path) show
+ * where they were written; if Discord rejects that layout, they're attached below instead.
+ */
+async function sendReply(send: Send, text: string, cwd: string, max = Number.POSITIVE_INFINITY): Promise<Message[]> {
+	const sent: Message[] = [];
+	const pieces = splitEmbeds(text, cwd);
+	if (pieces) {
+		try {
+			for (const message of embedMessages(pieces).slice(0, max)) {
+				sent.push(await send({ ...message, flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [] } }));
+			}
+			return sent;
+		} catch (err) {
+			if (sent.length > 0) throw err;
+		}
+	}
+	const uploads = (pieces ?? [])
+		.filter((piece): piece is Embed => typeof piece !== "string" && piece.path !== undefined)
+		.slice(0, MAX_V2_FILES)
+		.map((embed) => new AttachmentBuilder(embed.path!));
+	const chunks = chunkText(text).slice(0, max);
+	for (let i = 0; i < chunks.length; i++) {
+		const last = i === chunks.length - 1;
+		sent.push(await send({ content: chunks[i], files: last ? uploads : [], allowedMentions: { parse: [] } }));
+	}
+	if (chunks.length === 0 && uploads.length > 0) sent.push(await send({ files: uploads, allowedMentions: { parse: [] } }));
+	return sent;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,13 +590,6 @@ export default function (pi: ExtensionAPI) {
 		const run = queue.then(task);
 		queue = run.catch((err) => ctxRef?.ui.notify(`discord: ${(err as Error).message}`, "error"));
 		return run;
-	};
-
-	const setToolActive = (active: boolean) => {
-		const current = pi.getActiveTools();
-		if (current.includes(TOOL_NAME) === active) return;
-		const tools = current.filter((name) => name !== TOOL_NAME);
-		pi.setActiveTools(active ? [...tools, TOOL_NAME] : tools);
 	};
 
 	// --- typing indicator ----------------------------------------------------
@@ -501,22 +677,16 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** Post text (and optional files) after any pending status update. */
-	const post = (content: string, files: string[] = []) =>
+	const cwd = () => ctxRef?.cwd ?? process.cwd();
+
+	/** Post text, with any files it embeds, after any pending status update. */
+	const post = (content: string) =>
 		enqueue(async () => {
-			if (!dm) return;
+			const channel = dm;
+			if (!channel) return;
 			await flushStatus();
-			const chunks = chunkText(content);
-			if (chunks.length === 0 && files.length === 0) return;
-			for (let i = 0; i < chunks.length; i++) {
-				const last = i === chunks.length - 1;
-				await dm.send({
-					content: chunks[i],
-					files: last ? files.map((f) => new AttachmentBuilder(f)) : [],
-					allowedMentions: { parse: [] },
-				});
-			}
-			if (chunks.length === 0) await dm.send({ files: files.map((f) => new AttachmentBuilder(f)) });
-			if (statusMsg) statusStale = true;
+			const sent = await sendReply((options) => channel.send(options), content, cwd());
+			if (sent.length > 0 && statusMsg) statusStale = true;
 		});
 
 	const note = (text: string) => post(`-# ${text}`);
@@ -541,7 +711,11 @@ export default function (pi: ExtensionAPI) {
 			classifier = undefined;
 			return "no Jev classifier has credentials";
 		}
-		const state = { channel: origin.place, request: origin.request, answer: origin.answer ?? "" };
+		// The classifier reads text only, so files wait for review.
+		if (splitEmbeds(origin.answer ?? "", cwd())?.some((piece) => typeof piece !== "string" && piece.path)) {
+			return "it attaches files";
+		}
+		const state = { channel: origin.place, request: origin.request, answer: withoutEmbeds(origin.answer ?? "") };
 		const result: any = await registry.classify(chosen.model, { state, questions: { hold: HOLD_QUESTION } });
 		if (result.stopReason !== "stop") return `${chosen.name} failed`;
 		const probability = result.answers.hold.probability as number;
@@ -555,14 +729,7 @@ export default function (pi: ExtensionAPI) {
 	const postOrigin = async (origin: Origin, click?: ButtonInteraction) => {
 		const via = Date.now() - origin.at < TOKEN_TTL_MS ? origin.interaction : click;
 		if (!via) throw new Error("the 15 minutes to post there ran out");
-		const chunks = chunkText(origin.answer ?? "").slice(0, MAX_FOLLOWUPS);
-		const files = origin.files.map((f) => new AttachmentBuilder(f));
-		let first: Message | undefined;
-		for (let i = 0; i < chunks.length; i++) {
-			const last = i === chunks.length - 1;
-			const sent = await via.followUp({ content: chunks[i], files: last ? files : [], allowedMentions: { parse: [] } });
-			first ??= sent;
-		}
+		const [first] = await sendReply((options) => via.followUp(options), origin.answer ?? "", cwd(), MAX_FOLLOWUPS);
 		origin.posted = true;
 		// Permissions can change after the form was opened; Discord then hides the post.
 		if (first?.flags.has(MessageFlags.Ephemeral)) void note(`only you can see the post: apps can't post publicly [there](${origin.link})`);
@@ -591,7 +758,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		await origin.interaction.editReply({
-			content: previewText(origin.answer, origin.files, reason ? `Held for review: ${reason}` : "Pi's answer"),
+			content: previewText(origin.answer, reason ? `Held for review: ${reason}` : "Pi's answer"),
 			components: [postButton(origin)],
 			allowedMentions: { parse: [] },
 		});
@@ -926,7 +1093,6 @@ export default function (pi: ExtensionAPI) {
 				place,
 				link: here,
 				request: lines.join("\n"),
-				files: [],
 				posted: false,
 			};
 			origins.set(origin.id, origin);
@@ -941,7 +1107,7 @@ export default function (pi: ExtensionAPI) {
 
 	const onLockChange = () => {
 		if (client && !ownsLock()) {
-			void disconnect({ release: false, tools: true });
+			void disconnect({ release: false });
 			ctxRef?.ui.notify("Discord DM was taken over by another pi session", "warning");
 		}
 	};
@@ -979,7 +1145,6 @@ export default function (pi: ExtensionAPI) {
 				client = next;
 				writeLock();
 				watchFile(LOCK_FILE, { interval: 1000 }, onLockChange);
-				setToolActive(true);
 				ctx.ui.setStatus("discord", `discord: @${user.username}`);
 			} catch (err) {
 				await next.destroy().catch(() => {});
@@ -991,7 +1156,7 @@ export default function (pi: ExtensionAPI) {
 		return connecting;
 	};
 
-	const disconnect = async (options: { release: boolean; tools: boolean }) => {
+	const disconnect = async (options: { release: boolean }) => {
 		unwatchFile(LOCK_FILE, onLockChange);
 		if (armed) finishRun();
 		stopTyping();
@@ -1001,7 +1166,6 @@ export default function (pi: ExtensionAPI) {
 		dm = undefined;
 		await current?.destroy().catch(() => {});
 		if (options.release) releaseLock();
-		if (options.tools) setToolActive(false);
 		ctxRef?.ui.setStatus("discord", undefined);
 	};
 
@@ -1014,50 +1178,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const tryConnect = (ctx: ExtensionContext) =>
-		connect(ctx).catch((err) => {
-			setToolActive(false);
-			ctx.ui.notify(`discord: ${(err as Error).message}`, "error");
-		});
+		connect(ctx).catch((err) => ctx.ui.notify(`discord: ${(err as Error).message}`, "error"));
 
 	// --- registration --------------------------------------------------------------
 
 	pi.registerFlag("discord", { description: "Connect this session to the Discord DM", type: "boolean" });
-
-	pi.registerTool({
-		name: TOOL_NAME,
-		label: "Discord files",
-		description:
-			"Upload local files to the user's Discord DM as attachments, with an optional caption. Use only for files; ordinary replies are forwarded automatically.",
-		promptSnippet: "Upload local files to the user's Discord DM",
-		promptGuidelines: [
-			`User messages beginning with ${PREFIX} were sent from the user's Discord DM. Your assistant text while answering them is forwarded to that DM automatically, so reply naturally, like texting. Don't use a tool to send text.`,
-			`If a reply to a ${PREFIX} message needs no Discord message, make that text exactly [silent].`,
-			`${PREFIX} messages "sent with /yo" or "sharing" a message came from another Discord channel, named by server and channel ID. The user may want something answered in that channel, or may just be showing you something. Your replies go to the DM, and the user can post your final one in that channel as a reply, with any files you sent with ${TOOL_NAME}. Write it for whoever it's really for: if it's meant for the channel, just answer, with no private details, and don't explain who or what you are or describe the user's setup unless asked; if it's for the user, just talk to them. This extension can't read that channel, but you might: before saying you can't, check AGENTS.md and your notes for access to that server, such as another bot.`,
-			`Use ${TOOL_NAME} to send files such as screenshots, images, logs or documents to the Discord DM. Discord renders Markdown but not tables.`,
-		],
-		parameters: Type.Object({
-			paths: Type.Array(Type.String({ description: "File path, absolute or relative to the working directory" }), {
-				minItems: 1,
-				maxItems: 10,
-			}),
-			caption: Type.Optional(Type.String({ description: "Optional message text sent with the files" })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!dm) throw new Error("Discord is not connected");
-			const files = params.paths.map((path) => expandPath(path, ctx.cwd));
-			for (const file of files) {
-				const stat = statSync(file);
-				if (!stat.isFile()) throw new Error(`${file} is not a file`);
-				if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`${file} is larger than 10 MB`);
-			}
-			await post(params.caption ?? "", files);
-			for (const origin of runOrigins) origin.files.push(...files);
-			return {
-				content: [{ type: "text", text: `Sent ${files.length} file(s) to Discord.` }],
-				details: { files },
-			};
-		},
-	});
 
 	pi.registerCommand("discord", {
 		description: "Discord DM bridge: /discord [on|off|status|setup]",
@@ -1071,7 +1196,7 @@ export default function (pi: ExtensionAPI) {
 				const userId = (await ctx.ui.input("Your Discord user ID", current.userId ?? ""))?.trim();
 				saveConfig({ token: token || current.token, userId: userId || current.userId });
 				ctx.ui.notify(`Saved ${CONFIG_FILE}`, "info");
-				if (client) await disconnect({ release: false, tools: false });
+				if (client) await disconnect({ release: false });
 			}
 
 			if (sub === "on" || sub === "setup") {
@@ -1098,7 +1223,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (sub === "off") {
-				await disconnect({ release: true, tools: true });
+				await disconnect({ release: true });
 				pi.appendEntry(ENTRY_TYPE, { enabled: false });
 				ctx.ui.notify("Discord DM disconnected", "info");
 				return;
@@ -1130,6 +1255,12 @@ export default function (pi: ExtensionAPI) {
 
 	// --- pi events --------------------------------------------------------------------
 
+	// The Discord instructions apply only while connected.
+	pi.on("before_agent_start", (event) => {
+		if (client || connecting) event.systemPromptOptions.sections.discord = DISCORD_GUIDE;
+		else delete event.systemPromptOptions.sections.discord;
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		ctxRef = ctx;
 		// Reconnect after /reload, /new or /resume in the owning process, when the
@@ -1137,7 +1268,6 @@ export default function (pi: ExtensionAPI) {
 		const wanted = pi.getFlag("discord") === true || ownsLock() || enabledInSession(ctx);
 		const holder = otherLockHolder();
 		if (!wanted || holder) {
-			setToolActive(false);
 			if (wanted && holder) ctx.ui.notify(`Discord DM is owned by pi process ${holder}; /discord to take over`, "info");
 			return;
 		}
@@ -1146,7 +1276,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		clearOutbox();
-		await disconnect({ release: event.reason === "quit", tools: false });
+		await disconnect({ release: event.reason === "quit" });
 	});
 
 	pi.on("message_start", (event, ctx) => {
