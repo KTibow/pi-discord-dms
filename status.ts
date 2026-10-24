@@ -16,6 +16,8 @@ const PREVIEW_LINES = 8;
 /** Lines before an image's own line that share its row, so the thumbnail isn't taller than its text. */
 const IMAGE_CONTEXT = 3;
 const HOME = homedir();
+/** Characters of inline code that stay on one line: Discord caps components v2 messages at 600px. */
+const WIDTH = 60;
 
 /** A downscaled image, uploaded with the message that shows it. */
 export interface Thumb {
@@ -60,7 +62,7 @@ function plural(count: number, noun: string): string {
 }
 
 /** Text squeezed onto one line, safe inside inline code. */
-export function oneLine(text: string, max = 80): string {
+export function oneLine(text: string, max = WIDTH): string {
 	const line = text.replace(/\s+/g, " ").replace(/`/g, "'").trim();
 	return line.length > max ? `${line.slice(0, max - 3)}…` : line;
 }
@@ -83,16 +85,21 @@ function tidyPath(path: string, cwd: string): string {
 	return absolute === HOME || absolute.startsWith(`${HOME}/`) ? `~${absolute.slice(HOME.length)}` : absolute;
 }
 
-/** A command as a prompt line: a leading `cd dir &&` becomes the prompt, as in a shell. */
-function describeCommand(command: string): string {
+/**
+ * A command as a prompt line. A leading `cd dir &&` becomes the prompt, unless it's into pi's
+ * own directory, and only the first line of a multi-line command shows.
+ */
+function describeCommand(command: string, cwd: string): string {
 	const cd = command.match(/^\s*cd\s+("[^"]*"|'[^']*'|\S+)\s*(?:&&|;|\n)\s*/);
 	let prompt = "$";
 	if (cd) {
 		const dir = cd[1].replace(/^["']|["']$/g, "").replace(/\/+$/, "");
-		prompt = `${basename(dir) || dir} $`;
+		if (resolve(cwd, dir.replace(/^~(?=\/|$)/, HOME)) !== resolve(cwd)) prompt = `${basename(dir) || dir} $`;
 		command = command.slice(cd[0].length);
 	}
-	return `\`${oneLine(`${prompt} ${command.replaceAll(HOME, "~")}`, 72)}\``;
+	const [first, ...rest] = command.trim().split("\n");
+	const more = rest.some((line) => line.trim()) ? " …" : "";
+	return `\`${oneLine(`${prompt} ${first.replaceAll(HOME, "~")}${more}`)}\``;
 }
 
 function patchStats(patch: string): string {
@@ -105,8 +112,8 @@ function patchStats(patch: string): string {
 /** One line for a call, from its name and (possibly partial) arguments. */
 export function describeCall(name: string, args: Record<string, unknown>, cwd: string, patch?: string): string {
 	const rawPath = args.path ?? args.file_path;
-	const path = typeof rawPath === "string" && rawPath ? `\`${oneLine(tidyPath(rawPath, cwd), 72)}\`` : "";
-	if (name === "bash" && typeof args.command === "string") return describeCommand(args.command);
+	const path = typeof rawPath === "string" && rawPath ? `\`${oneLine(tidyPath(rawPath, cwd))}\`` : "";
+	if (name === "bash" && typeof args.command === "string") return describeCommand(args.command, cwd);
 	if (name === "read" && path) {
 		const offset = typeof args.offset === "number" ? args.offset : undefined;
 		const limit = typeof args.limit === "number" ? args.limit : undefined;
@@ -146,7 +153,7 @@ function outputLines(output: string): { lines: string[]; code?: string } {
 function failure(tool: ToolLine): string {
 	const { lines, code } = outputLines(tool.output ?? "");
 	const reason = (tool.name === "bash" ? lines.findLast((l) => l.trim()) : lines.find((l) => l.trim())) ?? "";
-	const parts = [code && `exit ${code}`, reason && `\`${oneLine(reason, 100)}\``].filter(Boolean);
+	const parts = [code && `exit ${code}`, reason && `\`${oneLine(reason, 80)}\``].filter(Boolean);
 	return parts.length > 0 ? `\n-# ${parts.join(" · ")}` : "";
 }
 

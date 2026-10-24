@@ -110,7 +110,7 @@ Messages from Discord reach pi prefixed with `[discord]`. Seeing one of these in
 - While armed, each assistant message's text is posted to the DM. That includes the short
   comments pi writes between tool calls, just as the TUI shows them.
 - Tool calls are listed in one status message, which arrives silently. Commands read like a
-  shell prompt, so `cd dir && make` shows as `dir $ make`. Failed calls show their exit code and
+  shell prompt, so `cd dir && make` shows as `dir $ make`, or `$ make` when `dir` is pi's own. Failed calls show their exit code and
   last line of output, and running ones show how long they've been going. The latest call also
   shows its last lines of output, its diff or the start of the file it wrote. The latest image pi
   read appears beside its line. Between tool calls, one more line shows what pi is thinking or
