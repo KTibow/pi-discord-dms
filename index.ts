@@ -266,6 +266,22 @@ function describeReply(quoted: Message, fromPi: boolean): string {
  * Context for a message picked with "Send to pi", in the user's voice. It arrives as
  * raw API data when the bot isn't in that server.
  */
+function describeEmbed(embed: Message["embeds"][number] | APIMessage["embeds"][number]): string[] {
+	const lines: string[] = [];
+	if (embed.author?.name) lines.push(`author: ${embed.author.name}`);
+	if (embed.title) lines.push(embed.title);
+	if (embed.url) lines.push(`url: ${embed.url}`);
+	if (embed.description) lines.push(embed.description);
+	for (const field of embed.fields ?? []) lines.push(`${field.name}: ${field.value}`);
+	if (embed.provider?.name) lines.push(`provider: ${embed.provider.name}`);
+	if (embed.provider?.url) lines.push(`provider url: ${embed.provider.url}`);
+	if (embed.footer?.text) lines.push(`footer: ${embed.footer.text}`);
+	if (embed.image?.url) lines.push(`image: ${embed.image.url}`);
+	if (embed.thumbnail?.url) lines.push(`thumbnail: ${embed.thumbnail.url}`);
+	if (embed.video?.url) lines.push(`video: ${embed.video.url}`);
+	return lines;
+}
+
 function describeShared(target: Message | APIMessage, where: string, userId: string, botId: string) {
 	const author =
 		target.author.id === userId
@@ -277,8 +293,8 @@ function describeShared(target: Message | APIMessage, where: string, userId: str
 	const quote = (text: string) => lines.push(...text.split("\n").map((line) => `> ${line}`));
 	if (target.content) quote(target.content);
 	for (const embed of target.embeds) {
-		const text = [embed.title, embed.description].filter(Boolean).join("\n");
-		if (text) quote(`[embed] ${text}`);
+		const text = describeEmbed(embed).join("\n");
+		if (text) quote(`[embed]\n${text}`);
 	}
 	const files: IncomingFile[] =
 		target instanceof Message
